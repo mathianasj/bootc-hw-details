@@ -1,0 +1,5 @@
+# Python deps for the Ansible control node.
+# After this, install collections:
+#   ansible-galaxy collection install -r ansible/requirements.yml
+ansible>=9.0.0,<12
+requests>=2.28.0

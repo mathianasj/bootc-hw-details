@@ -32,8 +32,8 @@ End-to-end flow on the control node:
 ### Control-node deps
 
 ```bash
-# Ansible + Redfish modules
-python3 -m pip install --user ansible
+# Ansible + Python deps, then Redfish collection
+python3 -m pip install --user -r requirements.txt
 ansible-galaxy collection install -r ansible/requirements.yml
 
 # Live ISO build + SOL
