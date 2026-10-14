@@ -1,0 +1,13 @@
+# Live ISO contract (no Anaconda / no disk install).
+# CDLABEL must match `label` exactly for root=live:CDLABEL=...
+label: HWGATHER
+grub2:
+  default: 0
+  timeout: 3
+  entries:
+    - name: "hw-gather (live)"
+      linux: "/images/pxeboot/vmlinuz root=live:CDLABEL=HWGATHER rd.live.image rd.live.overlay.overlayfs=1 console=tty0 console=ttyS0,115200n8 enforcing=0"
+      initrd: "/images/pxeboot/initrd.img"
+    - name: "hw-gather (live, serial only)"
+      linux: "/images/pxeboot/vmlinuz root=live:CDLABEL=HWGATHER rd.live.image rd.live.overlay.overlayfs=1 console=ttyS0,115200n8 console=tty0 enforcing=0"
+      initrd: "/images/pxeboot/initrd.img"

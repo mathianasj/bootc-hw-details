@@ -1,0 +1,35 @@
+---
+# Copy to inventory.yml and fill in BMC details.
+all:
+  hosts:
+    localhost:
+      ansible_connection: local
+      ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  vars:
+    # BMC / Redfish
+    redfish_address: "bmc.example.com"
+    redfish_username: "admin"
+    redfish_password: "{{ lookup('env', 'REDFISH_PASSWORD') }}"
+    # Optional: override if IPMI SOL uses different creds (defaults to Redfish)
+    # ipmi_username: "admin"
+    # ipmi_password: "{{ lookup('env', 'IPMI_PASSWORD') }}"
+
+    # Image / live ISO build (does not install to disk)
+    image_name: "localhost/bootc-hw-gather:latest"
+    iso_builder_image: "ghcr.io/ublue-os/titanoboa:latest"
+    podman_cmd: "sudo podman"
+    skip_build: false
+
+    # HTTP serve so the BMC can pull the ISO (must be reachable from BMC)
+    # iso_http_bind: "0.0.0.0"
+    # iso_http_port: 8080
+    # iso_http_host: "{{ ansible_default_ipv4.address }}"
+
+    # Redfish virtual media (vendor-dependent)
+    redfish_vm_category: "Manager"   # or Systems
+    # redfish_vm_resource_id: "BMC"  # e.g. BMC, 1, iDRAC.Embedded.1
+    # redfish_system_id: "1"
+
+    # Timing (live boot — no Anaconda)
+    sol_timeout_seconds: 900
+    post_reboot_settle_seconds: 45

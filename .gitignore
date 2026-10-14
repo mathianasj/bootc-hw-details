@@ -1,0 +1,35 @@
+# Build / ISO artifacts
+output/
+*.iso
+*.qcow2
+*.raw
+*.vmdk
+*.tar
+*.tar.xz
+
+# Ansible local inventory (may contain hostnames / secrets)
+ansible/inventory.yml
+*.retry
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# Python
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+.cursor/

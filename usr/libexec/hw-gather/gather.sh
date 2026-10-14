@@ -1,0 +1,205 @@
+#!/usr/bin/bash
+# Collect disk, NIC, and LLDP info; emit a scrapeable block on the serial console.
+set -uo pipefail
+
+OUT_DIR="${HW_GATHER_OUT_DIR:-/var/log/hw-gather}"
+LLDP_WAIT_SECS="${HW_GATHER_LLDP_WAIT:-45}"
+# Unique markers for Redfish / SOL terminal scrapers.
+MARKER_BEGIN="${HW_GATHER_MARKER_BEGIN:-###HW-GATHER-BEGIN###}"
+MARKER_END="${HW_GATHER_MARKER_END:-###HW-GATHER-END###}"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+REPORT="${OUT_DIR}/report-${STAMP}.txt"
+LATEST="${OUT_DIR}/latest.txt"
+SERIAL_BLOCK="${OUT_DIR}/serial-${STAMP}.txt"
+
+mkdir -p "${OUT_DIR}"
+
+log() {
+  printf '%s\n' "$*" >>"${REPORT}"
+}
+
+section() {
+  log ""
+  log "================================================================================"
+  log "$*"
+  log "================================================================================"
+}
+
+run_cmd() {
+  local title="$1"
+  shift
+  section "${title}"
+  log "+ $*"
+  if output="$("$@" 2>&1)"; then
+    log "${output}"
+  else
+    rc=$?
+    log "${output}"
+    log "(exit ${rc})"
+  fi
+}
+
+bring_up_nics() {
+  local iface
+  for iface in /sys/class/net/*; do
+    iface="${iface##*/}"
+    case "${iface}" in
+      lo|bonding_masters) continue ;;
+    esac
+    ip link set dev "${iface}" up 2>/dev/null || true
+  done
+}
+
+wait_for_lldp() {
+  local elapsed=0
+  local neighbors=""
+
+  section "Waiting up to ${LLDP_WAIT_SECS}s for LLDP neighbors"
+  while (( elapsed < LLDP_WAIT_SECS )); do
+    if systemctl is-active --quiet lldpd.service 2>/dev/null; then
+      neighbors="$(lldpcli show neighbors 2>/dev/null || true)"
+      if grep -qE 'Interface:|ChassisID:|SysName:|PortID:' <<<"${neighbors}"; then
+        log "LLDP neighbors detected after ${elapsed}s"
+        return 0
+      fi
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  log "Timed out waiting for LLDP neighbors (switches must have LLDP enabled)"
+}
+
+# Resolve devices that Redfish SOL / BMC serial typically mirrors.
+# Prefer kernel console= devices from /proc/cmdline, then common UART names.
+serial_targets() {
+  local -a found=()
+  local token dev
+
+  if [[ -r /proc/cmdline ]]; then
+    for token in $(tr ' ' '\n' </proc/cmdline | grep '^console='); do
+      token="${token#console=}"
+      dev="${token%%,*}"
+      case "${dev}" in
+        ttyS[0-9]*|ttyAMA[0-9]*|ttyUSB[0-9]*|ttyACM[0-9]*|hvc[0-9]*)
+          found+=("/dev/${dev}")
+          ;;
+      esac
+    done
+  fi
+
+  # Always try the kernel console device and common BMC UART paths.
+  found+=("/dev/console" "/dev/ttyS0" "/dev/ttyS1" "/dev/ttyAMA0")
+
+  printf '%s\n' "${found[@]}" | awk 'NF && !seen[$0]++'
+}
+
+stop_serial_gettys() {
+  # Keep login prompts from interleaving with the scrape block on SOL.
+  local unit
+  for unit in serial-getty@ttyS0.service serial-getty@ttyS1.service \
+              serial-getty@ttyAMA0.service getty@ttyS0.service; do
+    systemctl stop "${unit}" 2>/dev/null || true
+  done
+}
+
+emit_to_serial() {
+  local path="$1"
+  local target
+  local wrote=0
+
+  stop_serial_gettys
+  # Let the port settle after getty release.
+  sleep 1
+
+  while IFS= read -r target; do
+    [[ -e "${target}" ]] || continue
+    # Best-effort: ignore stty failures on non-tty nodes.
+    stty -F "${target}" raw -echo 2>/dev/null || true
+    if cat "${path}" >"${target}" 2>/dev/null; then
+      wrote=1
+    fi
+  done < <(serial_targets)
+
+  # Last resort: kernel console (often the same UART under console=ttyS0).
+  if [[ "${wrote}" -eq 0 ]] && [[ -e /dev/console ]]; then
+    cat "${path}" >/dev/console 2>/dev/null || true
+  fi
+}
+
+: >"${REPORT}"
+
+section "Host"
+log "Hostname: $(hostnamectl --static 2>/dev/null || hostname)"
+log "UTC time: ${STAMP}"
+log "Kernel:   $(uname -r)"
+log "Product:  $(cat /sys/class/dmi/id/product_name 2>/dev/null || echo unknown)"
+log "Serial:   $(cat /sys/class/dmi/id/product_serial 2>/dev/null || echo unknown)"
+log "UUID:     $(cat /sys/class/dmi/id/product_uuid 2>/dev/null || echo unknown)"
+
+run_cmd "Block devices (lsblk)" \
+  lsblk -o NAME,PATH,SIZE,TYPE,FSTYPE,MODEL,SERIAL,WWN,TRAN,ROTA,STATE,MOUNTPOINTS
+
+run_cmd "Disk IDs (/dev/disk/by-id)" \
+  bash -c 'ls -l /dev/disk/by-id 2>/dev/null || echo "(none)"'
+
+if command -v smartctl >/dev/null 2>&1; then
+  section "SMART summary (per disk)"
+  while read -r disk; do
+    [[ -z "${disk}" ]] && continue
+    log ""
+    log "--- ${disk} ---"
+    smartctl -i -H "${disk}" >>"${REPORT}" 2>&1 || true
+  done < <(lsblk -dn -o NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}')
+fi
+
+bring_up_nics
+sleep 3
+
+run_cmd "Network interfaces (ip -d addr)" ip -d addr
+run_cmd "Routing" ip route
+run_cmd "PCI network devices" bash -c "lspci -nn | grep -iE 'ethernet|network' || true"
+
+section "ethtool per interface"
+for iface in /sys/class/net/*; do
+  iface="${iface##*/}"
+  case "${iface}" in
+    lo|bonding_masters) continue ;;
+  esac
+  log ""
+  log "--- ${iface} ---"
+  {
+    ethtool "${iface}" 2>&1 || true
+    ethtool -i "${iface}" 2>&1 || true
+    ethtool -P "${iface}" 2>&1 || true
+  } >>"${REPORT}"
+done
+
+wait_for_lldp
+
+run_cmd "LLDP neighbors (switch / port mapping)" lldpcli show neighbors details
+run_cmd "LLDP statistics" lldpcli show statistics
+run_cmd "LLDP interfaces" lldpcli show interfaces details
+
+section "Done"
+log "Full report: ${REPORT}"
+log "Latest:      ${LATEST}"
+
+ln -sfn "${REPORT}" "${LATEST}"
+
+# Build one scrapeable serial payload (markers + body + markers).
+{
+  printf '\n%s\n' "${MARKER_BEGIN}"
+  printf 'hw-gather-version: 1\n'
+  printf 'utc: %s\n' "${STAMP}"
+  printf 'hostname: %s\n' "$(hostnamectl --static 2>/dev/null || hostname)"
+  printf '\n'
+  cat "${REPORT}"
+  printf '\n%s\n\n' "${MARKER_END}"
+} >"${SERIAL_BLOCK}"
+
+emit_to_serial "${SERIAL_BLOCK}"
+
+# Also keep a copy in the journal for debugging.
+systemd-cat -t hw-gather <"${SERIAL_BLOCK}" 2>/dev/null || true
+
+exit 0

@@ -1,0 +1,294 @@
+---
+# Build live bootc ISO → Redfish virtual media → boot → scrape SOL for hw-gather.
+#
+# The ISO is a live environment (dmsquash-live). It does NOT install to disk.
+#
+#   ansible-galaxy collection install -r requirements.yml
+#   export REDFISH_PASSWORD='...'
+#   ansible-playbook -i inventory.yml playbook.yml \
+#     -e redfish_address=10.0.0.50 \
+#     -e redfish_username=admin
+
+- name: bootc-hw-gather via Redfish virtual media + SOL
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    repo_root: "{{ playbook_dir | dirname }}"
+    output_dir: "{{ repo_root }}/output"
+    iso_dir: "{{ output_dir }}/iso"
+    capture_dir: "{{ output_dir }}/captures/{{ redfish_address | default('bmc') }}"
+    image_name: "localhost/bootc-hw-gather:latest"
+    # Builds a live ISO from a container that ships iso.yaml + dmsquash-live initramfs.
+    iso_builder_image: "ghcr.io/ublue-os/titanoboa:latest"
+    skip_build: false
+
+    redfish_address: ""
+    redfish_username: ""
+    redfish_password: "{{ lookup('env', 'REDFISH_PASSWORD') }}"
+    redfish_validate_certs: false
+    redfish_vm_category: "Manager"
+    redfish_vm_resource_id: ""
+    redfish_system_id: ""
+    redfish_bootdevice: "Cd"
+
+    ipmi_username: "{{ redfish_username }}"
+    ipmi_password: "{{ redfish_password }}"
+    ipmi_port: 623
+
+    iso_http_bind: "0.0.0.0"
+    iso_http_port: 8080
+    iso_http_host: "{{ ansible_default_ipv4.address | default(ansible_host) }}"
+    iso_filename: "bootc-hw-gather.iso"
+
+    # Live ISO build needs rootful podman + host container storage
+    podman_cmd: "sudo podman"
+
+    # Live boot + LLDP wait — no Anaconda install time
+    sol_timeout_seconds: 900
+    post_reboot_settle_seconds: 45
+    sol_capture_script: "{{ playbook_dir }}/scripts/sol_capture.py"
+
+    _http_pid_file: "{{ output_dir }}/.iso-http.pid"
+
+  pre_tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - redfish_address | length > 0
+          - redfish_username | length > 0
+          - redfish_password | length > 0
+        fail_msg: >-
+          Set redfish_address, redfish_username, and REDFISH_PASSWORD
+          (or redfish_password). This live ISO does not install to disk.
+
+    - name: Ensure output directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ output_dir }}"
+        - "{{ iso_dir }}"
+        - "{{ capture_dir }}"
+
+  tasks:
+    # ------------------------------------------------------------------ build
+    - name: Build bootc container image (live-capable)
+      ansible.builtin.command:
+        cmd: >-
+          {{ podman_cmd }} build
+          --cap-add sys_admin
+          --security-opt label=disable
+          -t {{ image_name }}
+          {{ repo_root }}
+      when: not skip_build | bool
+      tags: [build]
+
+    - name: Build live ISO with titanoboa (no disk install)
+      ansible.builtin.command:
+        cmd: >-
+          {{ podman_cmd }} run --rm --privileged
+          --security-opt label=disable
+          -v {{ output_dir }}:/output
+          -v /var/lib/containers/storage:/usr/lib/containers/storage:ro
+          --mount type=image,source={{ image_name }},dst=/rootfs
+          {{ iso_builder_image }}
+      when: not skip_build | bool
+      tags: [build]
+
+    - name: Locate built ISO
+      ansible.builtin.find:
+        paths:
+          - "{{ output_dir }}"
+          - "{{ iso_dir }}"
+        patterns:
+          - "*.iso"
+        recurse: true
+      register: iso_find
+      tags: [build, deploy]
+
+    - name: Fail if no ISO found
+      ansible.builtin.assert:
+        that:
+          - iso_find.files | length > 0
+        fail_msg: >-
+          No .iso found under {{ output_dir }}. Build first (omit skip_build)
+          or place an ISO there.
+      tags: [build, deploy]
+
+    - name: Pick newest ISO and stage under iso/
+      ansible.builtin.copy:
+        src: "{{ (iso_find.files | sort(attribute='mtime') | last).path }}"
+        dest: "{{ iso_dir }}/{{ iso_filename }}"
+        remote_src: true
+        mode: "0644"
+      tags: [build, deploy]
+
+    - name: Set ISO URL for BMC
+      ansible.builtin.set_fact:
+        iso_image_url: "http://{{ iso_http_host }}:{{ iso_http_port }}/{{ iso_filename }}"
+      tags: [deploy]
+
+    - name: Show ISO URL the BMC will fetch
+      ansible.builtin.debug:
+        msg: >-
+          Serving {{ iso_dir }}/{{ iso_filename }} as {{ iso_image_url }}
+          (BMC must be able to reach this host:port)
+      tags: [deploy]
+
+    # ----------------------------------------------------------- HTTP server
+    - name: Stop any previous ISO HTTP server
+      ansible.builtin.shell: |
+        set -e
+        if [ -f "{{ _http_pid_file }}" ]; then
+          kill "$(cat "{{ _http_pid_file }}")" 2>/dev/null || true
+          rm -f "{{ _http_pid_file }}"
+        fi
+      args:
+        executable: /bin/bash
+      tags: [deploy]
+      changed_when: true
+
+    - name: Start HTTP server for virtual media ISO
+      ansible.builtin.shell: |
+        set -e
+        cd "{{ iso_dir }}"
+        nohup python3 -m http.server {{ iso_http_port }} --bind {{ iso_http_bind }} \
+          >"{{ output_dir }}/iso-http.log" 2>&1 &
+        echo $! >"{{ _http_pid_file }}"
+        sleep 1
+        kill -0 "$(cat "{{ _http_pid_file }}")"
+      args:
+        executable: /bin/bash
+      tags: [deploy]
+      changed_when: true
+
+    # -------------------------------------------------------------- Redfish
+    - name: Build common Redfish auth args
+      ansible.builtin.set_fact:
+        redfish_auth:
+          baseuri: "{{ redfish_address }}"
+          username: "{{ redfish_username }}"
+          password: "{{ redfish_password }}"
+      tags: [deploy]
+
+    - name: Eject existing virtual media (ignore errors)
+      community.general.redfish_command:
+        category: "{{ redfish_vm_category }}"
+        command: VirtualMediaEject
+        baseuri: "{{ redfish_auth.baseuri }}"
+        username: "{{ redfish_auth.username }}"
+        password: "{{ redfish_auth.password }}"
+        resource_id: "{{ redfish_vm_resource_id | default(omit, true) }}"
+      failed_when: false
+      tags: [deploy]
+
+    - name: Insert live ISO via Redfish virtual media
+      community.general.redfish_command:
+        category: "{{ redfish_vm_category }}"
+        command: VirtualMediaInsert
+        baseuri: "{{ redfish_auth.baseuri }}"
+        username: "{{ redfish_auth.username }}"
+        password: "{{ redfish_auth.password }}"
+        resource_id: "{{ redfish_vm_resource_id | default(omit, true) }}"
+        virtual_media:
+          image_url: "{{ iso_image_url }}"
+          media_types:
+            - CD
+            - DVD
+          inserted: true
+          write_protected: true
+      register: vm_insert
+      tags: [deploy]
+
+    - name: Set one-time boot to CD (virtual media)
+      community.general.redfish_command:
+        category: Systems
+        command: SetOneTimeBoot
+        bootdevice: "{{ redfish_bootdevice }}"
+        baseuri: "{{ redfish_auth.baseuri }}"
+        username: "{{ redfish_auth.username }}"
+        password: "{{ redfish_auth.password }}"
+        resource_id: "{{ redfish_system_id | default(omit, true) }}"
+      tags: [deploy]
+
+    - name: Power cycle system to boot live ISO
+      community.general.redfish_command:
+        category: Systems
+        command: PowerCycle
+        baseuri: "{{ redfish_auth.baseuri }}"
+        username: "{{ redfish_auth.username }}"
+        password: "{{ redfish_auth.password }}"
+        resource_id: "{{ redfish_system_id | default(omit, true) }}"
+      tags: [deploy]
+
+    - name: Wait for firmware / live boot to start
+      ansible.builtin.pause:
+        seconds: "{{ post_reboot_settle_seconds }}"
+      tags: [deploy, capture]
+
+    # ----------------------------------------------------------- SOL capture
+    - name: Capture serial console until hw-gather markers
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ sol_capture_script }}"
+          - --host
+          - "{{ redfish_address }}"
+          - --username
+          - "{{ ipmi_username }}"
+          - --password
+          - "{{ ipmi_password }}"
+          - --port
+          - "{{ ipmi_port | string }}"
+          - --timeout
+          - "{{ sol_timeout_seconds | string }}"
+          - --output
+          - "{{ capture_dir }}/sol-raw.log"
+          - --report
+          - "{{ capture_dir }}/hw-gather-report.txt"
+          - --verbose
+      register: sol_capture
+      environment:
+        IPMI_PASSWORD: "{{ ipmi_password }}"
+      tags: [capture]
+
+    - name: Show parsed hw-gather report
+      ansible.builtin.debug:
+        var: sol_capture.stdout
+      tags: [capture]
+
+    - name: Confirm report files on control node
+      ansible.builtin.debug:
+        msg:
+          - "Raw SOL log: {{ capture_dir }}/sol-raw.log"
+          - "Parsed report: {{ capture_dir }}/hw-gather-report.txt"
+      tags: [capture]
+
+  post_tasks:
+    - name: Stop ISO HTTP server
+      ansible.builtin.shell: |
+        set -e
+        if [ -f "{{ _http_pid_file }}" ]; then
+          kill "$(cat "{{ _http_pid_file }}")" 2>/dev/null || true
+          rm -f "{{ _http_pid_file }}"
+        fi
+      args:
+        executable: /bin/bash
+      tags: [always]
+      changed_when: true
+      failed_when: false
+
+    - name: Optionally eject virtual media
+      community.general.redfish_command:
+        category: "{{ redfish_vm_category }}"
+        command: VirtualMediaEject
+        baseuri: "{{ redfish_address }}"
+        username: "{{ redfish_username }}"
+        password: "{{ redfish_password }}"
+        resource_id: "{{ redfish_vm_resource_id | default(omit, true) }}"
+      when: eject_virtual_media | default(true) | bool
+      failed_when: false
+      tags: [always]

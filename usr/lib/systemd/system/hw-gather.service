@@ -1,0 +1,20 @@
+[Unit]
+Description=Gather disk, NIC, and LLDP inventory (serial console / Redfish SOL)
+Documentation=file:///usr/libexec/hw-gather/gather.sh
+After=network-online.target lldpd.service
+Wants=network-online.target
+Requires=lldpd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/hw-gather/gather.sh
+RemainAfterExit=yes
+# Allow time for LLDP advertisements from the switch.
+TimeoutStartSec=180
+# Avoid interleaving unit stdout with the scrape block; the script writes
+# the full marked report directly to serial devices.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
