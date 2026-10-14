@@ -1,11 +1,22 @@
-# Python deps for the Ansible control node.
+# Python deps for the Ansible control node (pip / venv).
 #
-# Use a venv (Homebrew Python is PEP 668 managed):
+# RHEL 9 (Python 3.9) — preferred system packages instead of pip:
+#   sudo dnf install -y ansible-core python3-pip
+#   ansible-galaxy collection install -r ansible/requirements.yml
+#
+# Or venv + pip on RHEL 9:
 #   python3 -m venv .venv
 #   source .venv/bin/activate
+#   pip install -U pip
 #   pip install -r requirements.txt
 #   ansible-galaxy collection install -r ansible/requirements.yml
 #
-# Python 3.14 needs Ansible 14+. On 3.11–3.13, Ansible 9+ also works.
-ansible>=14.0.0
+# Ansible version is selected by your Python:
+#   3.12+     -> ansible 14+
+#   3.10–3.11 -> ansible 9–12
+#   3.9       -> ansible 8.x  (RHEL 9 default)
+
+ansible>=14.0.0; python_version >= "3.12"
+ansible>=9.0.0,<13; python_version >= "3.10" and python_version < "3.12"
+ansible>=8.0.0,<9; python_version >= "3.9" and python_version < "3.10"
 requests>=2.28.0

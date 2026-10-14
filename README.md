@@ -31,20 +31,40 @@ End-to-end flow on the control node:
 
 ### Control-node deps
 
-```bash
-# Ansible + Python deps (venv required on Homebrew / PEP 668 Python)
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-ansible-galaxy collection install -r ansible/requirements.yml
+**RHEL 9** (Python 3.9) — prefer RPMs, not pip Ansible 14:
 
-# Live ISO build + SOL
-# - rootful podman (titanoboa + container storage)
-# - ipmitool (SOL capture)
-sudo dnf install -y ipmitool   # or brew install ipmitool
+```bash
+sudo dnf install -y ansible-core python3-pip ipmitool
+ansible-galaxy collection install -r ansible/requirements.yml
 ```
 
-On Python 3.14, Ansible **14+** is required (`requirements.txt` already pins that).
+Or venv + pip (installs **Ansible 8.x**, the last series that supports Python 3.9):
+
+```bash
+sudo dnf install -y python3-pip python3-venv ipmitool
+./scripts/setup-ansible.sh
+source .venv/bin/activate
+```
+
+Manual venv on RHEL 9:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
+ansible-galaxy collection install -r ansible/requirements.yml
+```
+
+`requirements.txt` picks Ansible by Python version:
+
+| Python | Ansible | Typical OS |
+|--------|---------|------------|
+| 3.9 | 8.x | RHEL 9 |
+| 3.10–3.11 | 9–12 | |
+| 3.12+ | 14+ | Fedora macOS Homebrew |
+
+Do **not** use `ansible>=14` on RHEL 9’s system Python — that is what causes `No matching distribution found`.
 
 ### Configure and run
 
