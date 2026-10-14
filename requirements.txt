@@ -1,5 +1,11 @@
 # Python deps for the Ansible control node.
-# After this, install collections:
+#
+# Use a venv (Homebrew Python is PEP 668 managed):
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements.txt
 #   ansible-galaxy collection install -r ansible/requirements.yml
-ansible>=9.0.0,<12
+#
+# Python 3.14 needs Ansible 14+. On 3.11–3.13, Ansible 9+ also works.
+ansible>=14.0.0
 requests>=2.28.0

@@ -32,8 +32,10 @@ End-to-end flow on the control node:
 ### Control-node deps
 
 ```bash
-# Ansible + Python deps, then Redfish collection
-python3 -m pip install --user -r requirements.txt
+# Ansible + Python deps (venv required on Homebrew / PEP 668 Python)
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ansible-galaxy collection install -r ansible/requirements.yml
 
 # Live ISO build + SOL
@@ -41,6 +43,8 @@ ansible-galaxy collection install -r ansible/requirements.yml
 # - ipmitool (SOL capture)
 sudo dnf install -y ipmitool   # or brew install ipmitool
 ```
+
+On Python 3.14, Ansible **14+** is required (`requirements.txt` already pins that).
 
 ### Configure and run
 

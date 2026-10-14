@@ -25,6 +25,7 @@ credentials.json
 *.egg-info/
 .venv/
 venv/
+.envrc
 
 # Editor / OS
 .DS_Store
