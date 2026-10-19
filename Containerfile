@@ -5,10 +5,13 @@ RUN <<EOF
 set -euxo pipefail
 
 # The base image points subscription-manager at the container host.
-# Drop that so the build can use entitlements mounted from the subscribed host.
+# Drop that so the build can use entitlements + repos mounted from the subscribed host.
 rm -f /etc/rhsm-host
 
-dnf -y install \
+# Host must bind-mount /etc/yum.repos.d (redhat.repo), /etc/pki/entitlement,
+# /etc/rhsm, and preferably /etc/pki/consumer into this build.
+dnf -y --setopt=sslverifystatus=0 repolist
+dnf -y --setopt=sslverifystatus=0 install \
     lldpd \
     ethtool \
     pciutils \

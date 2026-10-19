@@ -117,11 +117,14 @@ SOL uses **IPMI-over-LAN** (`ipmitool sol activate`) against the same BMC addres
 ## Manual build (live ISO)
 
 ```bash
+# Needs a subscribed RHEL host: entitlements + redhat.repo are bind-mounted into the build.
 sudo podman build \
   --cap-add sys_admin \
   --security-opt label=disable \
   -v /etc/pki/entitlement:/etc/pki/entitlement:ro \
+  -v /etc/pki/consumer:/etc/pki/consumer:ro \
   -v /etc/rhsm:/etc/rhsm:ro \
+  -v /etc/yum.repos.d:/etc/yum.repos.d:ro \
   -t localhost/bootc-hw-gather:latest .
 
 mkdir -p output
