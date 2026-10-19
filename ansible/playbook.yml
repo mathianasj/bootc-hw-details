@@ -6,7 +6,7 @@
 #   ansible-galaxy collection install -r requirements.yml
 #   export REDFISH_PASSWORD='...'
 #   ansible-playbook -i inventory.yml playbook.yml \
-#     -e redfish_address=10.0.0.50 \
+#     -e redfish_address='https://192.168.100.1:8000/redfish/v1/Systems/<uuid>' \
 #     -e redfish_username=admin
 
 - name: bootc-hw-gather via Redfish virtual media + SOL
@@ -24,7 +24,11 @@
     iso_builder_image: "ghcr.io/ublue-os/titanoboa:latest"
     skip_build: false
 
+    # Host, host:port, or a full Systems URL:
+    # https://192.168.100.1:8000/redfish/v1/Systems/<uuid>
     redfish_address: ""
+    redfish_baseuri: ""
+    redfish_bmc_host: ""
     redfish_username: ""
     redfish_password: "{{ lookup('env', 'REDFISH_PASSWORD') }}"
     redfish_validate_certs: false
@@ -62,6 +66,47 @@
         fail_msg: >-
           Set redfish_address, redfish_username, and REDFISH_PASSWORD
           (or redfish_password). This live ISO does not install to disk.
+
+    - name: Split a full Redfish Systems URL into host:port and system id
+      ansible.builtin.set_fact:
+        redfish_baseuri: >-
+          {{
+            (redfish_address | urlsplit('hostname'))
+            ~ (
+              ':' ~ (redfish_address | urlsplit('port') | string)
+              if (redfish_address | urlsplit('port'))
+              else ''
+            )
+          }}
+        redfish_bmc_host: "{{ redfish_address | urlsplit('hostname') }}"
+        redfish_system_id: >-
+          {{
+            redfish_system_id
+            if (redfish_system_id | default('') | length) > 0
+            else (
+              (redfish_address | urlsplit('path')).rstrip('/').split('/') | last
+              if '/Systems/' in (redfish_address | urlsplit('path'))
+              else ''
+            )
+          }}
+      when: redfish_address is match('^https?://')
+
+    - name: Use host or host:port when redfish_address is not a URL
+      ansible.builtin.set_fact:
+        redfish_baseuri: "{{ redfish_address }}"
+        redfish_bmc_host: "{{ redfish_address.split(':') | first }}"
+      when: redfish_baseuri | length == 0
+
+    - name: Show resolved Redfish target
+      ansible.builtin.debug:
+        msg:
+          - "baseuri: {{ redfish_baseuri }}"
+          - "system id: {{ redfish_system_id | default('(default system)') }}"
+          - "SOL host: {{ redfish_bmc_host }}"
+
+    - name: Set capture directory from BMC host
+      ansible.builtin.set_fact:
+        capture_dir: "{{ output_dir }}/captures/{{ redfish_bmc_host }}"
 
     - name: Ensure output directories exist
       ansible.builtin.file:
@@ -169,7 +214,7 @@
     - name: Build common Redfish auth args
       ansible.builtin.set_fact:
         redfish_auth:
-          baseuri: "{{ redfish_address }}"
+          baseuri: "{{ redfish_baseuri }}"
           username: "{{ redfish_username }}"
           password: "{{ redfish_password }}"
       tags: [deploy]
@@ -236,7 +281,7 @@
           - python3
           - "{{ sol_capture_script }}"
           - --host
-          - "{{ redfish_address }}"
+          - "{{ redfish_bmc_host }}"
           - --username
           - "{{ ipmi_username }}"
           - --password
@@ -285,7 +330,7 @@
       community.general.redfish_command:
         category: "{{ redfish_vm_category }}"
         command: VirtualMediaEject
-        baseuri: "{{ redfish_address }}"
+        baseuri: "{{ redfish_baseuri }}"
         username: "{{ redfish_username }}"
         password: "{{ redfish_password }}"
         resource_id: "{{ redfish_vm_resource_id | default(omit, true) }}"

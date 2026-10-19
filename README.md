@@ -76,9 +76,11 @@ export REDFISH_PASSWORD='your-bmc-password'
 
 cd ansible
 ansible-playbook -i inventory.yml playbook.yml \
-  -e redfish_address=10.0.0.50 \
+  -e redfish_address='https://192.168.100.1:8000/redfish/v1/Systems/<uuid>' \
   -e redfish_username=admin
 ```
+
+`redfish_address` can be a host, `host:port`, or a full `https://…/redfish/v1/Systems/<id>` URL. The playbook sends `host:port` to the Redfish modules and uses the UUID as the system id. Serial capture still uses IPMI on the host (port 623), not the Redfish port.
 
 Skip rebuild on later runs:
 

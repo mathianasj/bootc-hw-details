@@ -6,8 +6,8 @@ all:
       ansible_connection: local
       ansible_python_interpreter: "{{ ansible_playbook_python }}"
   vars:
-    # BMC / Redfish
-    redfish_address: "bmc.example.com"
+    # BMC / Redfish. Host, host:port, or a full Systems URL.
+    redfish_address: "https://192.168.100.1:8000/redfish/v1/Systems/93134133-30a3-4950-9a79-4233016ceb0a"
     redfish_username: "admin"
     redfish_password: "{{ lookup('env', 'REDFISH_PASSWORD') }}"
     # Optional: override if IPMI SOL uses different creds (defaults to Redfish)
