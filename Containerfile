@@ -4,6 +4,10 @@ FROM registry.redhat.io/rhel9/rhel-bootc:latest
 RUN <<EOF
 set -euxo pipefail
 
+# The base image points subscription-manager at the container host.
+# Drop that so the build can use entitlements mounted from the subscribed host.
+rm -f /etc/rhsm-host
+
 dnf -y install \
     lldpd \
     ethtool \

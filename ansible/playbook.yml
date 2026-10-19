@@ -126,6 +126,8 @@
           {{ podman_cmd }} build
           --cap-add sys_admin
           --security-opt label=disable
+          -v /etc/pki/entitlement:/etc/pki/entitlement:ro
+          -v /etc/rhsm:/etc/rhsm:ro
           -t {{ image_name }}
           {{ repo_root }}
       when: not skip_build | bool

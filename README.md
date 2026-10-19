@@ -120,6 +120,8 @@ SOL uses **IPMI-over-LAN** (`ipmitool sol activate`) against the same BMC addres
 sudo podman build \
   --cap-add sys_admin \
   --security-opt label=disable \
+  -v /etc/pki/entitlement:/etc/pki/entitlement:ro \
+  -v /etc/rhsm:/etc/rhsm:ro \
   -t localhost/bootc-hw-gather:latest .
 
 mkdir -p output
