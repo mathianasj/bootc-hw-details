@@ -2,6 +2,7 @@
 # Build live bootc ISO → Redfish virtual media → boot → scrape SOL for hw-gather.
 #
 # The ISO is a live environment (dmsquash-live). It does NOT install to disk.
+# Live ISO is produced with osbuild image-builder (bootc-generic-iso).
 #
 #   ansible-galaxy collection install -r requirements.yml
 #   export REDFISH_PASSWORD='...'
@@ -18,10 +19,20 @@
     repo_root: "{{ playbook_dir | dirname }}"
     output_dir: "{{ repo_root }}/output"
     iso_dir: "{{ output_dir }}/iso"
+    iso_build_dir: "{{ output_dir }}/iso-build"
     capture_dir: "{{ output_dir }}/captures/{{ redfish_address | default('bmc') }}"
     image_name: "localhost/bootc-hw-gather:latest"
-    # Builds a live ISO from a container that ships iso.yaml + dmsquash-live initramfs.
-    iso_builder_image: "ghcr.io/ublue-os/titanoboa:latest"
+    # host = local image-builder CLI; container = podman run image_builder_image
+    iso_builder_mode: host
+    image_builder_cmd: "sudo image-builder"
+    image_builder_image: "ghcr.io/osbuild/image-builder-cli:latest"
+    # Install image-builder on localhost when missing (dnf / osbuild COPR on RHEL)
+    install_image_builder: true
+    # COPR chroot override; empty = derive from facts (rhel-9-x86_64, fedora-41-x86_64, …)
+    image_builder_copr_chroot: ""
+    bootc_default_fs: ext4
+    # Optional buildroot with ISO tools; empty = use image_name (ships the tools)
+    bootc_build_ref: ""
     skip_build: false
 
     # Host, host:port, or a full Systems URL:
@@ -120,6 +131,17 @@
 
   tasks:
     # ------------------------------------------------------------------ build
+    - name: Ensure CDN BaseOS/AppStream repos are available on the build host
+      ansible.builtin.command:
+        cmd: >-
+          sudo subscription-manager repos
+          --enable=rhel-9-for-x86_64-baseos-rpms
+          --enable=rhel-9-for-x86_64-appstream-rpms
+      when: not skip_build | bool
+      failed_when: false
+      changed_when: true
+      tags: [build]
+
     - name: Build bootc container image (live-capable)
       ansible.builtin.command:
         cmd: >-
@@ -135,21 +157,184 @@
       when: not skip_build | bool
       tags: [build]
 
-    - name: Build live ISO with titanoboa (no disk install)
+    - name: Ensure ISO build output directory exists
+      ansible.builtin.file:
+        path: "{{ iso_build_dir }}"
+        state: directory
+        mode: "0755"
+      when: not skip_build | bool
+      tags: [build]
+
+    - name: Check for image-builder CLI when iso_builder_mode=host
+      ansible.builtin.command:
+        cmd: bash -c "command -v image-builder"
+      register: image_builder_which
+      changed_when: false
+      failed_when: false
+      when:
+        - not skip_build | bool
+        - iso_builder_mode | default('host') == 'host'
+      tags: [build]
+
+    - name: Derive COPR chroot for image-builder install
+      ansible.builtin.set_fact:
+        _image_builder_copr_chroot: >-
+          {{
+            image_builder_copr_chroot
+            if (image_builder_copr_chroot | default('') | length) > 0
+            else (
+              (
+                'rhel'
+                if ansible_distribution == 'RedHat'
+                else (ansible_distribution | lower)
+              )
+              ~ '-' ~ ansible_distribution_major_version
+              ~ '-' ~ ansible_architecture
+            )
+          }}
+      when:
+        - not skip_build | bool
+        - iso_builder_mode | default('host') == 'host'
+        - image_builder_which.rc | default(1) != 0
+        - install_image_builder | default(true) | bool
+      tags: [build]
+
+    - name: Install dnf-plugins-core for COPR
+      ansible.builtin.command:
+        cmd: sudo dnf install -y dnf-plugins-core
+      when:
+        - not skip_build | bool
+        - iso_builder_mode | default('host') == 'host'
+        - image_builder_which.rc | default(1) != 0
+        - install_image_builder | default(true) | bool
+        - ansible_os_family == 'RedHat'
+      tags: [build]
+      changed_when: true
+
+    - name: Enable osbuild COPRs on RHEL-like hosts
       ansible.builtin.command:
         cmd: >-
-          {{ podman_cmd }} run --rm --privileged
-          --security-opt label=disable
-          -v {{ output_dir }}:/output
-          -v /var/lib/containers/storage:/usr/lib/containers/storage:ro
-          --mount type=image,source={{ image_name }},dst=/rootfs
-          {{ iso_builder_image }}
-      when: not skip_build | bool
+          sudo dnf -y copr enable @osbuild/{{ item }}
+          {{ _image_builder_copr_chroot }}
+      loop:
+        - osbuild
+        - image-builder
+      when:
+        - not skip_build | bool
+        - iso_builder_mode | default('host') == 'host'
+        - image_builder_which.rc | default(1) != 0
+        - install_image_builder | default(true) | bool
+        - ansible_distribution in ['RedHat', 'CentOS', 'Rocky', 'AlmaLinux']
+      tags: [build]
+      changed_when: true
+
+    - name: Install image-builder package on localhost
+      ansible.builtin.command:
+        cmd: sudo dnf install -y image-builder
+      when:
+        - not skip_build | bool
+        - iso_builder_mode | default('host') == 'host'
+        - image_builder_which.rc | default(1) != 0
+        - install_image_builder | default(true) | bool
+      tags: [build]
+      changed_when: true
+
+    - name: Re-check image-builder CLI after install
+      ansible.builtin.command:
+        cmd: bash -c "command -v image-builder"
+      register: image_builder_which
+      changed_when: false
+      when:
+        - not skip_build | bool
+        - iso_builder_mode | default('host') == 'host'
+        - install_image_builder | default(true) | bool
+      tags: [build]
+
+    - name: Fail if image-builder is still missing
+      ansible.builtin.fail:
+        msg: >-
+          image-builder not found after install attempt. Fix dnf/COPR access on
+          this host, set image_builder_copr_chroot explicitly, set
+          install_image_builder=false and install manually, or use
+          iso_builder_mode=container with a pullable image_builder_image.
+      when:
+        - not skip_build | bool
+        - iso_builder_mode | default('host') == 'host'
+        - image_builder_which.rc | default(1) != 0
+      tags: [build]
+
+    - name: Assemble image-builder arguments (host paths)
+      ansible.builtin.set_fact:
+        _ib_build_args: "{{
+            ['build', '--bootc-ref', image_name]
+            + (
+              ['--bootc-build-ref', bootc_build_ref]
+              if (bootc_build_ref | default('') | length) > 0
+              else []
+            )
+            + [
+              '--bootc-default-fs', bootc_default_fs,
+              '--output-dir', iso_build_dir,
+              '--output-name', (iso_filename | regex_replace('\\.iso$', '')),
+              'bootc-generic-iso'
+            ]
+          }}"
+      when:
+        - not skip_build | bool
+        - iso_builder_mode | default('host') == 'host'
+      tags: [build]
+
+    - name: Assemble image-builder arguments (container paths)
+      ansible.builtin.set_fact:
+        _ib_build_args: "{{
+            ['build', '--bootc-ref', image_name]
+            + (
+              ['--bootc-build-ref', bootc_build_ref]
+              if (bootc_build_ref | default('') | length) > 0
+              else []
+            )
+            + [
+              '--bootc-default-fs', bootc_default_fs,
+              '--output-dir', '/output',
+              '--output-name', (iso_filename | regex_replace('\\.iso$', '')),
+              'bootc-generic-iso'
+            ]
+          }}"
+      when:
+        - not skip_build | bool
+        - iso_builder_mode | default('host') == 'container'
+      tags: [build]
+
+    - name: Build live ISO with image-builder (bootc-generic-iso, host)
+      ansible.builtin.command:
+        argv: "{{ image_builder_cmd.split() + _ib_build_args }}"
+      when:
+        - not skip_build | bool
+        - iso_builder_mode | default('host') == 'host'
+      tags: [build]
+
+    - name: Build live ISO with image-builder (bootc-generic-iso, container)
+      ansible.builtin.command:
+        argv: "{{
+            podman_cmd.split()
+            + [
+              'run', '--rm', '--privileged',
+              '--security-opt', 'label=disable',
+              '-v', iso_build_dir ~ ':/output',
+              '-v', '/var/lib/containers/storage:/var/lib/containers/storage',
+              image_builder_image
+            ]
+            + _ib_build_args
+          }}"
+      when:
+        - not skip_build | bool
+        - iso_builder_mode | default('host') == 'container'
       tags: [build]
 
     - name: Locate built ISO
       ansible.builtin.find:
         paths:
+          - "{{ iso_build_dir }}"
           - "{{ output_dir }}"
           - "{{ iso_dir }}"
         patterns:

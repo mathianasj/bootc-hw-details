@@ -8,10 +8,30 @@ set -euxo pipefail
 # Drop that so the build can use entitlements + repos mounted from the subscribed host.
 rm -f /etc/rhsm-host
 
-# Host must bind-mount /etc/yum.repos.d (redhat.repo), /etc/pki/entitlement,
-# /etc/rhsm, and preferably /etc/pki/consumer into this build.
-dnf -y --setopt=sslverifystatus=0 repolist
-dnf -y --setopt=sslverifystatus=0 install \
+# Host must bind-mount /etc/yum.repos.d, /etc/pki/entitlement, /etc/rhsm,
+# and /etc/pki/consumer. Prefer the manual CDN repos when present; otherwise
+# subscription-manager CDN repo ids. sslverify=0 avoids the entitlement-CA
+# error this host's dnf hits even when sslcacert is set.
+if [[ -f /etc/yum.repos.d/rhel9-cdn-manual.repo ]]; then
+  mapfile -t DNF_CDN < <(printf '%s\n' \
+    --setopt=sslverify=0 \
+    --setopt=sslverifystatus=0 \
+    --disablerepo='*' \
+    --enablerepo=rhel9-baseos-manual \
+    --enablerepo=rhel9-appstream-manual)
+else
+  mapfile -t DNF_CDN < <(printf '%s\n' \
+    --setopt=sslverify=0 \
+    --setopt=sslverifystatus=0 \
+    --disablerepo='*' \
+    --enablerepo=rhel-9-for-x86_64-baseos-rpms \
+    --enablerepo=rhel-9-for-x86_64-appstream-rpms)
+fi
+dnf -y "${DNF_CDN[@]}" repolist
+# Live ISO contract tools (image-builder bootc-generic-iso):
+# mksquashfs, xorriso, implantisomd5, grub2-mkimage, python, podman.
+# rhel-bootc already ships podman + python3.
+dnf -y "${DNF_CDN[@]}" install \
     lldpd \
     ethtool \
     pciutils \
@@ -22,6 +42,9 @@ dnf -y --setopt=sslverifystatus=0 install \
     openssh-server \
     dracut-live \
     squashfs-tools \
+    xorriso \
+    isomd5sum \
+    grub2-tools \
     grub2-efi-x64-cdboot \
     grub2-pc-modules \
     grub2-common

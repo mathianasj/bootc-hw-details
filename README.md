@@ -23,13 +23,15 @@ LLDP only works if the attached switch has LLDP (or compatible CDP receive) enab
 End-to-end flow on the control node:
 
 1. Build the bootc image (live-capable initramfs + `iso.yaml`)
-2. Build a **live** ISO with titanoboa (no Anaconda, no disk install)
+2. Build a **live** ISO with osbuild `image-builder` (`bootc-generic-iso`, no Anaconda / no disk install)
 3. Serve the ISO over HTTP (BMC must reach the control node)
 4. Mount it with Redfish virtual media, one-time boot to CD, power cycle
 5. Attach IPMI SOL, wait for `###HW-GATHER-BEGIN###` … `###HW-GATHER-END###`
 6. Write the parsed report under `output/captures/<bmc>/`
 
 ### Control-node deps
+
+**image-builder** (live ISO step) is installed by the playbook on localhost when missing (`install_image_builder: true`). On RHEL it enables the `@osbuild` COPRs, then `dnf install image-builder`. Override with `image_builder_copr_chroot` if auto-detect is wrong, or set `iso_builder_mode=container` to use `image_builder_image` instead.
 
 **RHEL 9** (Python 3.9) — prefer RPMs, not pip Ansible 14:
 
@@ -105,6 +107,12 @@ Tags: `build`, `deploy`, `capture`.
 
 | Variable | Notes |
 |----------|--------|
+| `iso_builder_mode` | `host` (default) or `container` |
+| `image_builder_cmd` | Default `sudo image-builder` |
+| `install_image_builder` | Default `true` — playbook installs CLI via dnf/COPR if missing |
+| `image_builder_copr_chroot` | Optional COPR chroot (e.g. `rhel-9-x86_64`) |
+| `image_builder_image` | Container CLI image when `iso_builder_mode=container` |
+| `bootc_build_ref` | Optional separate buildroot; empty uses `image_name` |
 | `redfish_vm_category` | `Manager` (default) or `Systems` |
 | `redfish_vm_resource_id` | e.g. `BMC`, `1`, `iDRAC.Embedded.1` |
 | `redfish_system_id` | System resource for boot/power |
@@ -118,6 +126,11 @@ SOL uses **IPMI-over-LAN** (`ipmitool sol activate`) against the same BMC addres
 
 ```bash
 # Needs a subscribed RHEL host: entitlements + redhat.repo are bind-mounted into the build.
+# On the host, enable CDN repos (not RHUI) before building:
+#   sudo subscription-manager repos \
+#     --enable=rhel-9-for-x86_64-baseos-rpms \
+#     --enable=rhel-9-for-x86_64-appstream-rpms
+#   sudo dnf config-manager --disable '*rhui*' || true
 sudo podman build \
   --cap-add sys_admin \
   --security-opt label=disable \
@@ -127,16 +140,16 @@ sudo podman build \
   -v /etc/yum.repos.d:/etc/yum.repos.d:ro \
   -t localhost/bootc-hw-gather:latest .
 
-mkdir -p output
-sudo podman run --rm --privileged \
-  --security-opt label=disable \
-  -v ./output:/output \
-  -v /var/lib/containers/storage:/usr/lib/containers/storage:ro \
-  --mount type=image,source=localhost/bootc-hw-gather:latest,dst=/rootfs \
-  ghcr.io/ublue-os/titanoboa:latest
+mkdir -p output/iso-build
+sudo image-builder build \
+  --bootc-ref localhost/bootc-hw-gather:latest \
+  --bootc-default-fs ext4 \
+  --output-dir ./output/iso-build \
+  --output-name bootc-hw-gather \
+  bootc-generic-iso
 ```
 
-Live boot is configured in `usr/lib/bootc-image-builder/iso.yaml` (`root=live:CDLABEL=HWGATHER rd.live.image`).
+Live boot is configured in `usr/lib/bootc-image-builder/iso.yaml` (`root=live:CDLABEL=HWGATHER rd.live.image`), also linked for image-builder at `/usr/lib/image-builder/bootc/iso.yaml`.
 
 Optional: push the container for use as a normal bootc disk image too:
 

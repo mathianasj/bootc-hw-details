@@ -16,7 +16,13 @@ all:
 
     # Image / live ISO build (does not install to disk)
     image_name: "localhost/bootc-hw-gather:latest"
-    iso_builder_image: "ghcr.io/ublue-os/titanoboa:latest"
+    # host = local image-builder CLI (preferred); container = podman image_builder_image
+    iso_builder_mode: host
+    image_builder_cmd: "sudo image-builder"
+    install_image_builder: true
+    # image_builder_copr_chroot: "rhel-9-x86_64"  # only if auto-detect is wrong
+    # image_builder_image: "ghcr.io/osbuild/image-builder-cli:latest"
+    # bootc_build_ref: ""   # optional separate buildroot; empty uses image_name
     podman_cmd: "sudo podman"
     skip_build: false
 
