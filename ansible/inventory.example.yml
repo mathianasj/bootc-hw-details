@@ -16,6 +16,7 @@ all:
 
     # Image / live ISO build (does not install to disk)
     image_name: "localhost/bootc-hw-gather:latest"
+    image_name_osbuild: "localhost/bootc-hw-gather:osbuild"
     # host = local image-builder CLI (preferred); container = podman image_builder_image
     iso_builder_mode: host
     image_builder_cmd: "sudo image-builder"

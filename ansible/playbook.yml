@@ -22,6 +22,8 @@
     iso_build_dir: "{{ output_dir }}/iso-build"
     capture_dir: "{{ output_dir }}/captures/{{ redfish_address | default('bmc') }}"
     image_name: "localhost/bootc-hw-gather:latest"
+    # Unsigned rewrite for osbuild (signed RHEL layers often fail with "layer not known")
+    image_name_osbuild: "localhost/bootc-hw-gather:osbuild"
     # host = local image-builder CLI; container = podman run image_builder_image
     iso_builder_mode: host
     image_builder_cmd: "sudo image-builder"
@@ -287,10 +289,47 @@
         - image_builder_which.rc | default(1) != 0
       tags: [build]
 
+    - name: Ensure skopeo is available for unsigned image rewrite
+      ansible.builtin.command:
+        cmd: sudo dnf install -y skopeo
+      when: not skip_build | bool
+      tags: [build]
+      changed_when: true
+      failed_when: false
+
+    - name: Rematerialize bootc image without signatures for osbuild
+      ansible.builtin.shell: |
+        set -euo pipefail
+        # osbuild container-deploy often fails with "layer not known" on signed
+        # RHEL bootc images; rewrite to an unsigned tag in root storage.
+        {{ podman_cmd }} image exists "{{ image_name }}"
+        {{ podman_cmd }} rmi -f "{{ image_name_osbuild }}" 2>/dev/null || true
+        if command -v skopeo >/dev/null 2>&1 || command -v /usr/bin/skopeo >/dev/null 2>&1; then
+          sudo skopeo copy --remove-signatures \
+            "containers-storage:{{ image_name }}" \
+            "containers-storage:{{ image_name_osbuild }}"
+        else
+          archive="{{ output_dir }}/.bootc-osbuild.oci.tar"
+          rm -f "$archive"
+          {{ podman_cmd }} save --format oci-archive -o "$archive" "{{ image_name }}"
+          {{ podman_cmd }} load -i "$archive"
+          {{ podman_cmd }} tag "{{ image_name }}" "{{ image_name_osbuild }}"
+          rm -f "$archive"
+        fi
+        cid=$({{ podman_cmd }} create "{{ image_name_osbuild }}")
+        {{ podman_cmd }} mount "$cid" >/dev/null
+        {{ podman_cmd }} umount "$cid"
+        {{ podman_cmd }} rm "$cid"
+      args:
+        executable: /bin/bash
+      when: not skip_build | bool
+      tags: [build]
+      changed_when: true
+
     - name: Assemble image-builder arguments (host paths)
       ansible.builtin.set_fact:
         _ib_build_args: "{{
-            ['build', '--bootc-ref', image_name]
+            ['build', '--bootc-ref', image_name_osbuild]
             + (
               ['--bootc-build-ref', bootc_build_ref]
               if (bootc_build_ref | default('') | length) > 0
@@ -311,7 +350,7 @@
     - name: Assemble image-builder arguments (container paths)
       ansible.builtin.set_fact:
         _ib_build_args: "{{
-            ['build', '--bootc-ref', image_name]
+            ['build', '--bootc-ref', image_name_osbuild]
             + (
               ['--bootc-build-ref', bootc_build_ref]
               if (bootc_build_ref | default('') | length) > 0

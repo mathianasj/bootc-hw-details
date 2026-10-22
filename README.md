@@ -140,9 +140,15 @@ sudo podman build \
   -v /etc/yum.repos.d:/etc/yum.repos.d:ro \
   -t localhost/bootc-hw-gather:latest .
 
+# Rewrite without signatures first — osbuild often hits "layer not known"
+# on signed RHEL bootc images straight from containers-storage.
+sudo skopeo copy --remove-signatures \
+  containers-storage:localhost/bootc-hw-gather:latest \
+  containers-storage:localhost/bootc-hw-gather:osbuild
+
 mkdir -p output/iso-build
 sudo image-builder build \
-  --bootc-ref localhost/bootc-hw-gather:latest \
+  --bootc-ref localhost/bootc-hw-gather:osbuild \
   --bootc-default-fs ext4 \
   --output-dir ./output/iso-build \
   --output-name bootc-hw-gather \
