@@ -20,7 +20,7 @@ all:
     iso_builder_mode: host
     image_builder_cmd: "sudo image-builder"
     install_image_builder: true
-    # image_builder_copr_chroot: "rhel-9-x86_64"  # only if auto-detect is wrong
+    # image_builder_copr_chroot: "epel-9-x86_64"  # RHEL default; rhel-9 osbuild COPR is empty
     # image_builder_image: "ghcr.io/osbuild/image-builder-cli:latest"
     # bootc_build_ref: ""   # optional separate buildroot; empty uses image_name
     podman_cmd: "sudo podman"

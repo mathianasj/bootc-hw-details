@@ -31,7 +31,7 @@ End-to-end flow on the control node:
 
 ### Control-node deps
 
-**image-builder** (live ISO step) is installed by the playbook on localhost when missing (`install_image_builder: true`). On RHEL it enables the `@osbuild` COPRs, then `dnf install image-builder`. Override with `image_builder_copr_chroot` if auto-detect is wrong, or set `iso_builder_mode=container` to use `image_builder_image` instead.
+**image-builder** (live ISO step) is installed by the playbook on localhost when missing (`install_image_builder: true`). On RHEL it enables the `@osbuild` COPRs using the **EPEL** chroot (e.g. `epel-9-x86_64`) — the `rhel-9` osbuild COPR has no packages — then installs `image-builder` plus osbuild deps. Override with `image_builder_copr_chroot` if needed, or set `iso_builder_mode=container` to use `image_builder_image` instead.
 
 **RHEL 9** (Python 3.9) — prefer RPMs, not pip Ansible 14:
 
@@ -110,7 +110,7 @@ Tags: `build`, `deploy`, `capture`.
 | `iso_builder_mode` | `host` (default) or `container` |
 | `image_builder_cmd` | Default `sudo image-builder` |
 | `install_image_builder` | Default `true` — playbook installs CLI via dnf/COPR if missing |
-| `image_builder_copr_chroot` | Optional COPR chroot (e.g. `rhel-9-x86_64`) |
+| `image_builder_copr_chroot` | Optional COPR chroot (default on RHEL: `epel-9-x86_64`) |
 | `image_builder_image` | Container CLI image when `iso_builder_mode=container` |
 | `bootc_build_ref` | Optional separate buildroot; empty uses `image_name` |
 | `redfish_vm_category` | `Manager` (default) or `Systems` |

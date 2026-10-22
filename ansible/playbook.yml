@@ -28,7 +28,7 @@
     image_builder_image: "ghcr.io/osbuild/image-builder-cli:latest"
     # Install image-builder on localhost when missing (dnf / osbuild COPR on RHEL)
     install_image_builder: true
-    # COPR chroot override; empty = derive from facts (rhel-9-x86_64, fedora-41-x86_64, …)
+    # COPR chroot override; empty = epel-N on RHEL (rhel-N osbuild COPR is empty)
     image_builder_copr_chroot: ""
     bootc_default_fs: ext4
     # Optional buildroot with ISO tools; empty = use image_name (ships the tools)
@@ -178,18 +178,24 @@
 
     - name: Derive COPR chroot for image-builder install
       ansible.builtin.set_fact:
+        # @osbuild/osbuild has no packages in rhel-9 (0 builds); use epel-9 there.
+        # image-builder is published for both rhel-9 and epel-9.
         _image_builder_copr_chroot: >-
           {{
             image_builder_copr_chroot
             if (image_builder_copr_chroot | default('') | length) > 0
             else (
-              (
-                'rhel'
-                if ansible_distribution == 'RedHat'
-                else (ansible_distribution | lower)
+              'epel-' ~ ansible_distribution_major_version ~ '-' ~ ansible_architecture
+              if ansible_distribution in ['RedHat', 'Rocky', 'AlmaLinux']
+              else (
+                'centos-stream-' ~ ansible_distribution_major_version ~ '-' ~ ansible_architecture
+                if ansible_distribution == 'CentOS'
+                else (
+                  (ansible_distribution | lower)
+                  ~ '-' ~ ansible_distribution_major_version
+                  ~ '-' ~ ansible_architecture
+                )
               )
-              ~ '-' ~ ansible_distribution_major_version
-              ~ '-' ~ ansible_architecture
             )
           }}
       when:
@@ -211,6 +217,22 @@
       tags: [build]
       changed_when: true
 
+    - name: Drop stale osbuild COPR repos (e.g. empty rhel-9)
+      ansible.builtin.command:
+        cmd: sudo dnf -y copr remove @osbuild/{{ item }}
+      loop:
+        - osbuild
+        - image-builder
+      when:
+        - not skip_build | bool
+        - iso_builder_mode | default('host') == 'host'
+        - image_builder_which.rc | default(1) != 0
+        - install_image_builder | default(true) | bool
+        - ansible_distribution in ['RedHat', 'CentOS', 'Rocky', 'AlmaLinux']
+      failed_when: false
+      tags: [build]
+      changed_when: true
+
     - name: Enable osbuild COPRs on RHEL-like hosts
       ansible.builtin.command:
         cmd: >-
@@ -228,9 +250,11 @@
       tags: [build]
       changed_when: true
 
-    - name: Install image-builder package on localhost
+    - name: Install image-builder and osbuild deps on localhost
       ansible.builtin.command:
-        cmd: sudo dnf install -y image-builder
+        cmd: >-
+          sudo dnf install -y image-builder
+          osbuild osbuild-depsolve-dnf osbuild-luks2 osbuild-lvm2 osbuild-ostree
       when:
         - not skip_build | bool
         - iso_builder_mode | default('host') == 'host'
