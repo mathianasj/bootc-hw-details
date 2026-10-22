@@ -23,7 +23,7 @@ LLDP only works if the attached switch has LLDP (or compatible CDP receive) enab
 End-to-end flow on the control node:
 
 1. Build the bootc image (live-capable initramfs + `iso.yaml`)
-2. Build a **live** ISO with osbuild `image-builder` (`bootc-generic-iso`, no Anaconda / no disk install)
+2. Build a **live** ISO with `scripts/build-live-iso.sh` (dmsquash live ISO; no Anaconda / no disk install)
 3. Serve the ISO over HTTP (BMC must reach the control node)
 4. Mount it with Redfish virtual media, one-time boot to CD, power cycle
 5. Attach IPMI SOL, wait for `###HW-GATHER-BEGIN###` … `###HW-GATHER-END###`
@@ -31,7 +31,9 @@ End-to-end flow on the control node:
 
 ### Control-node deps
 
-**image-builder** (live ISO step) is installed by the playbook on localhost when missing (`install_image_builder: true`). On RHEL it enables the `@osbuild` COPRs using the **EPEL** chroot (e.g. `epel-9-x86_64`) — the `rhel-9` osbuild COPR has no packages — then installs `image-builder` plus osbuild deps. Override with `image_builder_copr_chroot` if needed, or set `iso_builder_mode=container` to use `image_builder_image` instead.
+**Live ISO** defaults to `iso_builder_mode=script` (`scripts/build-live-iso.sh`), which uses host `podman mount` + `mksquashfs`/`xorriso` and avoids osbuild. The playbook installs `squashfs-tools`, `xorriso`, `isomd5sum`, `grub2-tools`, and `dosfstools` when needed.
+
+Optional: `iso_builder_mode=host` uses osbuild `image-builder` (`bootc-generic-iso`); on RHEL that path enables `@osbuild` COPRs via **EPEL** (`epel-9-x86_64`).
 
 **RHEL 9** (Python 3.9) — prefer RPMs, not pip Ansible 14:
 
@@ -107,9 +109,10 @@ Tags: `build`, `deploy`, `capture`.
 
 | Variable | Notes |
 |----------|--------|
-| `iso_builder_mode` | `host` (default) or `container` |
-| `image_builder_cmd` | Default `sudo image-builder` |
-| `install_image_builder` | Default `true` — playbook installs CLI via dnf/COPR if missing |
+| `iso_builder_mode` | `script` (default), or `host` / `container` for image-builder |
+| `live_iso_script` | Path to `scripts/build-live-iso.sh` |
+| `image_builder_cmd` | Default `sudo image-builder` (host mode) |
+| `install_image_builder` | Default `true` — install CLI via dnf/COPR in host mode |
 | `image_builder_copr_chroot` | Optional COPR chroot (default on RHEL: `epel-9-x86_64`) |
 | `image_builder_image` | Container CLI image when `iso_builder_mode=container` |
 | `bootc_build_ref` | Optional separate buildroot; empty uses `image_name` |
@@ -140,22 +143,14 @@ sudo podman build \
   -v /etc/yum.repos.d:/etc/yum.repos.d:ro \
   -t localhost/bootc-hw-gather:latest .
 
-# Rewrite without signatures first — osbuild often hits "layer not known"
-# on signed RHEL bootc images straight from containers-storage.
-sudo skopeo copy --remove-signatures \
-  containers-storage:localhost/bootc-hw-gather:latest \
-  containers-storage:localhost/bootc-hw-gather:osbuild
-
-mkdir -p output/iso-build
-sudo image-builder build \
-  --bootc-ref localhost/bootc-hw-gather:osbuild \
-  --bootc-default-fs ext4 \
-  --output-dir ./output/iso-build \
-  --output-name bootc-hw-gather \
-  bootc-generic-iso
+mkdir -p output/iso output/iso-build
+sudo ./scripts/build-live-iso.sh \
+  --image localhost/bootc-hw-gather:latest \
+  --output ./output/iso/bootc-hw-gather.iso \
+  --workdir ./output/iso-build
 ```
 
-Live boot is configured in `usr/lib/bootc-image-builder/iso.yaml` (`root=live:CDLABEL=HWGATHER rd.live.image`), also linked for image-builder at `/usr/lib/image-builder/bootc/iso.yaml`.
+Live boot is configured in `usr/lib/bootc-image-builder/iso.yaml` (`root=live:CDLABEL=HWGATHER rd.live.image`).
 
 Optional: push the container for use as a normal bootc disk image too:
 

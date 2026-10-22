@@ -2,7 +2,8 @@
 # Build live bootc ISO → Redfish virtual media → boot → scrape SOL for hw-gather.
 #
 # The ISO is a live environment (dmsquash-live). It does NOT install to disk.
-# Live ISO is produced with osbuild image-builder (bootc-generic-iso).
+# Live ISO is built by scripts/build-live-iso.sh (iso_builder_mode=script).
+# Optional: iso_builder_mode=host|container for osbuild image-builder.
 #
 #   ansible-galaxy collection install -r requirements.yml
 #   export REDFISH_PASSWORD='...'
@@ -22,13 +23,14 @@
     iso_build_dir: "{{ output_dir }}/iso-build"
     capture_dir: "{{ output_dir }}/captures/{{ redfish_address | default('bmc') }}"
     image_name: "localhost/bootc-hw-gather:latest"
-    # Unsigned rewrite for osbuild (signed RHEL layers often fail with "layer not known")
+    # Unsigned rewrite for osbuild modes only
     image_name_osbuild: "localhost/bootc-hw-gather:osbuild"
-    # host = local image-builder CLI; container = podman run image_builder_image
-    iso_builder_mode: host
+    # script = repo live-ISO script (default); host|container = image-builder
+    iso_builder_mode: script
+    live_iso_script: "{{ repo_root }}/scripts/build-live-iso.sh"
     image_builder_cmd: "sudo image-builder"
     image_builder_image: "ghcr.io/osbuild/image-builder-cli:latest"
-    # Install image-builder on localhost when missing (dnf / osbuild COPR on RHEL)
+    # Install image-builder on localhost when missing (host mode only)
     install_image_builder: true
     # COPR chroot override; empty = epel-N on RHEL (rhel-N osbuild COPR is empty)
     image_builder_copr_chroot: ""
@@ -167,6 +169,33 @@
       when: not skip_build | bool
       tags: [build]
 
+    - name: Install live ISO host tools (script mode)
+      ansible.builtin.command:
+        cmd: >-
+          sudo dnf install -y squashfs-tools xorriso isomd5sum
+          grub2-tools grub2-pc-modules dosfstools
+      when:
+        - not skip_build | bool
+        - iso_builder_mode | default('script') == 'script'
+      tags: [build]
+      changed_when: true
+
+    - name: Build live ISO with scripts/build-live-iso.sh
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - "{{ live_iso_script }}"
+          - --image
+          - "{{ image_name }}"
+          - --output
+          - "{{ iso_dir }}/{{ iso_filename }}"
+          - --workdir
+          - "{{ iso_build_dir }}"
+      when:
+        - not skip_build | bool
+        - iso_builder_mode | default('script') == 'script'
+      tags: [build]
+
     - name: Check for image-builder CLI when iso_builder_mode=host
       ansible.builtin.command:
         cmd: bash -c "command -v image-builder"
@@ -175,7 +204,7 @@
       failed_when: false
       when:
         - not skip_build | bool
-        - iso_builder_mode | default('host') == 'host'
+        - iso_builder_mode | default('script') == 'host'
       tags: [build]
 
     - name: Derive COPR chroot for image-builder install
@@ -202,7 +231,7 @@
           }}
       when:
         - not skip_build | bool
-        - iso_builder_mode | default('host') == 'host'
+        - iso_builder_mode | default('script') == 'host'
         - image_builder_which.rc | default(1) != 0
         - install_image_builder | default(true) | bool
       tags: [build]
@@ -212,7 +241,7 @@
         cmd: sudo dnf install -y dnf-plugins-core
       when:
         - not skip_build | bool
-        - iso_builder_mode | default('host') == 'host'
+        - iso_builder_mode | default('script') == 'host'
         - image_builder_which.rc | default(1) != 0
         - install_image_builder | default(true) | bool
         - ansible_os_family == 'RedHat'
@@ -227,7 +256,7 @@
         - image-builder
       when:
         - not skip_build | bool
-        - iso_builder_mode | default('host') == 'host'
+        - iso_builder_mode | default('script') == 'host'
         - image_builder_which.rc | default(1) != 0
         - install_image_builder | default(true) | bool
         - ansible_distribution in ['RedHat', 'CentOS', 'Rocky', 'AlmaLinux']
@@ -245,7 +274,7 @@
         - image-builder
       when:
         - not skip_build | bool
-        - iso_builder_mode | default('host') == 'host'
+        - iso_builder_mode | default('script') == 'host'
         - image_builder_which.rc | default(1) != 0
         - install_image_builder | default(true) | bool
         - ansible_distribution in ['RedHat', 'CentOS', 'Rocky', 'AlmaLinux']
@@ -259,7 +288,7 @@
           osbuild osbuild-depsolve-dnf osbuild-luks2 osbuild-lvm2 osbuild-ostree
       when:
         - not skip_build | bool
-        - iso_builder_mode | default('host') == 'host'
+        - iso_builder_mode | default('script') == 'host'
         - image_builder_which.rc | default(1) != 0
         - install_image_builder | default(true) | bool
       tags: [build]
@@ -272,7 +301,7 @@
       changed_when: false
       when:
         - not skip_build | bool
-        - iso_builder_mode | default('host') == 'host'
+        - iso_builder_mode | default('script') == 'host'
         - install_image_builder | default(true) | bool
       tags: [build]
 
@@ -285,14 +314,16 @@
           iso_builder_mode=container with a pullable image_builder_image.
       when:
         - not skip_build | bool
-        - iso_builder_mode | default('host') == 'host'
+        - iso_builder_mode | default('script') == 'host'
         - image_builder_which.rc | default(1) != 0
       tags: [build]
 
     - name: Ensure skopeo is available for unsigned image rewrite
       ansible.builtin.command:
         cmd: sudo dnf install -y skopeo
-      when: not skip_build | bool
+      when:
+        - not skip_build | bool
+        - iso_builder_mode | default('script') in ['host', 'container']
       tags: [build]
       changed_when: true
       failed_when: false
@@ -322,7 +353,9 @@
         {{ podman_cmd }} rm "$cid"
       args:
         executable: /bin/bash
-      when: not skip_build | bool
+      when:
+        - not skip_build | bool
+        - iso_builder_mode | default('script') in ['host', 'container']
       tags: [build]
       changed_when: true
 
@@ -344,7 +377,7 @@
           }}"
       when:
         - not skip_build | bool
-        - iso_builder_mode | default('host') == 'host'
+        - iso_builder_mode | default('script') == 'host'
       tags: [build]
 
     - name: Assemble image-builder arguments (container paths)
@@ -365,7 +398,7 @@
           }}"
       when:
         - not skip_build | bool
-        - iso_builder_mode | default('host') == 'container'
+        - iso_builder_mode | default('script') == 'container'
       tags: [build]
 
     - name: Build live ISO with image-builder (bootc-generic-iso, host)
@@ -373,7 +406,7 @@
         argv: "{{ image_builder_cmd.split() + _ib_build_args }}"
       when:
         - not skip_build | bool
-        - iso_builder_mode | default('host') == 'host'
+        - iso_builder_mode | default('script') == 'host'
       tags: [build]
 
     - name: Build live ISO with image-builder (bootc-generic-iso, container)
@@ -391,7 +424,7 @@
           }}"
       when:
         - not skip_build | bool
-        - iso_builder_mode | default('host') == 'container'
+        - iso_builder_mode | default('script') == 'container'
       tags: [build]
 
     - name: Locate built ISO
