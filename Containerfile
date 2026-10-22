@@ -45,9 +45,11 @@ dnf -y "${DNF_CDN[@]}" install \
     xorriso \
     isomd5sum \
     grub2-tools \
+    grub2-efi-x64 \
     grub2-efi-x64-cdboot \
     grub2-pc-modules \
-    grub2-common
+    grub2-common \
+    shim-x64
 
 dnf clean all
 EOF
@@ -80,11 +82,43 @@ add_dracutmodules+=" dmsquash-live dmsquash-live-autooverlay "
 CONF
 
 # EFI layout expected by the container-native ISO contract.
-mkdir -p /boot/efi
-for efi_dir in /usr/lib/efi/*/*/EFI; do
+# Collect vendor EFI trees from /usr/lib/efi and package paths used on RHEL.
+mkdir -p /boot/efi/EFI/BOOT /boot/efi/EFI/redhat
+for efi_dir in /usr/lib/efi/*/*/EFI /usr/lib/efi/*/EFI; do
   [ -d "${efi_dir}" ] || continue
-  cp -ra "${efi_dir}" /boot/efi/
+  cp -ra "${efi_dir}/." /boot/efi/EFI/ 2>/dev/null || true
 done
+# shim-x64 / grub2-efi-x64 often land directly under /boot/efi already on installed
+# systems; in bootc images also check common package file locations.
+for shim in \
+  /boot/efi/EFI/redhat/shimx64.efi \
+  /boot/efi/EFI/BOOT/BOOTX64.EFI \
+  /usr/share/shim/shimx64.efi \
+  /usr/lib/shim/shimx64.efi \
+  /usr/libexec/shim/shimx64.efi
+do
+  if [[ -f "${shim}" ]]; then
+    cp -a "${shim}" /boot/efi/EFI/redhat/shimx64.efi
+    cp -a "${shim}" /boot/efi/EFI/BOOT/BOOTX64.EFI
+    break
+  fi
+done
+for grubefi in \
+  /boot/efi/EFI/redhat/grubx64.efi \
+  /usr/lib/grub/x86_64-efi/monolithic/grubx64.efi \
+  /usr/lib/grub/x86_64-efi-signed/grubx64.efi
+do
+  if [[ -f "${grubefi}" ]]; then
+    cp -a "${grubefi}" /boot/efi/EFI/redhat/grubx64.efi
+    break
+  fi
+done
+# Fail the image build early if we still have no removable-media EFI loader.
+if [[ ! -f /boot/efi/EFI/BOOT/BOOTX64.EFI ]]; then
+  echo "ERROR: no shim/BOOTX64.EFI found after EFI staging; searched:" >&2
+  find /usr/lib/efi /usr/share/shim /usr/lib/shim /boot/efi -iname '*shim*.efi' -o -iname 'BOOTX64.EFI' -o -iname 'grubx64.efi' 2>/dev/null | head >&2 || true
+  exit 1
+fi
 
 # Rebuild initramfs next to the kernel (required for live / generic ISO).
 vmlinuz="$(ls -1 /usr/lib/modules/*/vmlinuz | head -n1)"

@@ -155,23 +155,63 @@ cp -a "${KDIR}vmlinuz" "$ISO_ROOT/images/pxeboot/vmlinuz"
 cp -a "${KDIR}initramfs.img" "$ISO_ROOT/images/pxeboot/initrd.img"
 
 echo "==> copying EFI bootloaders"
+mkdir -p "$ISO_ROOT/EFI/BOOT" "$ISO_ROOT/EFI/redhat"
 if [[ -d "$ROOTFS/boot/efi/EFI" ]]; then
   cp -a "$ROOTFS/boot/efi/EFI/." "$ISO_ROOT/EFI/"
 fi
-# Removable-media layout expected by many firmwares.
-if [[ -f "$ISO_ROOT/EFI/redhat/shimx64.efi" ]]; then
-  cp -a "$ISO_ROOT/EFI/redhat/shimx64.efi" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI"
-elif [[ -f "$ISO_ROOT/EFI/centos/shimx64.efi" ]]; then
-  cp -a "$ISO_ROOT/EFI/centos/shimx64.efi" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI"
-elif [[ -f "$ISO_ROOT/EFI/fedora/shimx64.efi" ]]; then
-  cp -a "$ISO_ROOT/EFI/fedora/shimx64.efi" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI"
-elif [[ -f "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI" ]]; then
-  :
-else
-  # Fall back to any shimx64.efi we can find.
-  shim="$(find "$ISO_ROOT/EFI" -name 'shimx64.efi' | head -n1 || true)"
-  [[ -n "$shim" ]] || { echo "shimx64.efi not found under EFI" >&2; exit 1; }
-  cp -a "$shim" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI"
+# Also pull from /usr/lib/efi trees if /boot/efi was incomplete.
+for efi_dir in "$ROOTFS"/usr/lib/efi/*/*/EFI "$ROOTFS"/usr/lib/efi/*/EFI; do
+  [[ -d "$efi_dir" ]] || continue
+  cp -a "$efi_dir"/. "$ISO_ROOT/EFI/" 2>/dev/null || true
+done
+
+# Removable-media BOOTX64.EFI: prefer shim, then any existing BOOTX64, then grubx64.
+bootx64=""
+for candidate in \
+  "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI" \
+  "$ISO_ROOT/EFI/redhat/shimx64.efi" \
+  "$ISO_ROOT/EFI/centos/shimx64.efi" \
+  "$ISO_ROOT/EFI/fedora/shimx64.efi" \
+  "$ROOTFS/boot/efi/EFI/BOOT/BOOTX64.EFI" \
+  "$ROOTFS/boot/efi/EFI/redhat/shimx64.efi" \
+  "$ROOTFS/usr/share/shim/shimx64.efi" \
+  "$ROOTFS/usr/lib/shim/shimx64.efi"
+do
+  if [[ -f "$candidate" ]]; then
+    bootx64="$candidate"
+    break
+  fi
+done
+if [[ -z "$bootx64" ]]; then
+  bootx64="$(find "$ISO_ROOT/EFI" "$ROOTFS/boot/efi" "$ROOTFS/usr/lib/efi" "$ROOTFS/usr/share" \
+    \( -iname 'shimx64.efi' -o -iname 'BOOTX64.EFI' \) 2>/dev/null | head -n1 || true)"
+fi
+if [[ -z "$bootx64" ]]; then
+  # Last resort: unsigned grub EFI as the removable loader (no Secure Boot).
+  bootx64="$(find "$ISO_ROOT/EFI" "$ROOTFS" -iname 'grubx64.efi' 2>/dev/null | head -n1 || true)"
+fi
+if [[ -z "$bootx64" || ! -f "$bootx64" ]]; then
+  echo "EFI loader not found (shimx64.efi / BOOTX64.EFI / grubx64.efi)." >&2
+  echo "Searched under $ROOTFS/boot/efi and $ROOTFS/usr/lib/efi:" >&2
+  find "$ROOTFS/boot/efi" "$ROOTFS/usr/lib/efi" "$ROOTFS/usr/share/shim" \
+    -iname '*.efi' 2>/dev/null | head -n50 >&2 || true
+  exit 1
+fi
+cp -a "$bootx64" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI"
+# Keep a vendor copy when we found shim.
+case "$(basename "$bootx64")" in
+  shimx64.efi|BOOTX64.EFI)
+    cp -a "$bootx64" "$ISO_ROOT/EFI/redhat/shimx64.efi"
+    ;;
+esac
+# Ensure grubx64.efi exists next to shim when available.
+if [[ ! -f "$ISO_ROOT/EFI/redhat/grubx64.efi" ]]; then
+  grubefi="$(find "$ISO_ROOT/EFI" "$ROOTFS/boot/efi" "$ROOTFS/usr/lib/grub" \
+    -iname 'grubx64.efi' 2>/dev/null | head -n1 || true)"
+  if [[ -n "$grubefi" ]]; then
+    cp -a "$grubefi" "$ISO_ROOT/EFI/redhat/grubx64.efi"
+    cp -a "$grubefi" "$ISO_ROOT/EFI/BOOT/grubx64.efi"
+  fi
 fi
 
 echo "==> writing grub.cfg"
