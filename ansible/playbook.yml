@@ -504,6 +504,81 @@
           password: "{{ redfish_password }}"
       tags: [deploy]
 
+    - name: Discover Redfish Managers when virtual-media resource_id is unset
+      community.general.redfish_info:
+        category: Manager
+        command: GetManagerInventory
+        baseuri: "{{ redfish_auth.baseuri }}"
+        username: "{{ redfish_auth.username }}"
+        password: "{{ redfish_auth.password }}"
+        validate_certs: "{{ redfish_validate_certs }}"
+      register: redfish_managers
+      when:
+        - (redfish_vm_resource_id | default('') | length) == 0
+        - redfish_vm_category | default('Manager') == 'Manager'
+      tags: [deploy]
+
+    - name: Collect Manager Ids from inventory
+      ansible.builtin.set_fact:
+        _mgr_ids: >-
+          {{
+            redfish_managers.redfish_facts.manager.entries
+            | default([])
+            | map('last')
+            | selectattr('Id', 'defined')
+            | map(attribute='Id')
+            | list
+          }}
+      when:
+        - (redfish_vm_resource_id | default('') | length) == 0
+        - redfish_vm_category | default('Manager') == 'Manager'
+        - redfish_managers is defined
+        - not (redfish_managers.failed | default(false))
+        - redfish_managers.redfish_facts is defined
+        - redfish_managers.redfish_facts.manager is defined
+      tags: [deploy]
+
+    - name: Use sole Manager Id for virtual media
+      ansible.builtin.set_fact:
+        redfish_vm_resource_id: "{{ _mgr_ids | first }}"
+      when:
+        - (redfish_vm_resource_id | default('') | length) == 0
+        - (_mgr_ids | default([]) | length) == 1
+      tags: [deploy]
+
+    - name: Prefer a BMC-like Manager Id when several exist
+      ansible.builtin.set_fact:
+        redfish_vm_resource_id: "{{ _preferred_mgr | first }}"
+      vars:
+        _preferred_mgr: >-
+          {{
+            _mgr_ids
+            | default([])
+            | select('match', '(?i)^(BMC|iDRAC|1|Manager\\.Embedded\\.1|iDRAC\\.Embedded\\.1)$')
+            | list
+          }}
+      when:
+        - (redfish_vm_resource_id | default('') | length) == 0
+        - (_mgr_ids | default([]) | length) > 1
+        - (_preferred_mgr | length) > 0
+      tags: [deploy]
+
+    - name: Fail if Manager resource_id cannot be determined
+      ansible.builtin.fail:
+        msg: >-
+          Multiple (or zero) Redfish Managers found and redfish_vm_resource_id
+          is unset. Set -e redfish_vm_resource_id=<Id> (examples: BMC, 1,
+          iDRAC.Embedded.1). Discovered Ids: {{ _mgr_ids | default([]) }}.
+      when:
+        - redfish_vm_category | default('Manager') == 'Manager'
+        - (redfish_vm_resource_id | default('') | length) == 0
+      tags: [deploy]
+
+    - name: Show Redfish virtual-media Manager target
+      ansible.builtin.debug:
+        msg: "Virtual media Manager resource_id={{ redfish_vm_resource_id }}"
+      tags: [deploy]
+
     - name: Eject existing virtual media (ignore errors)
       community.general.redfish_command:
         category: "{{ redfish_vm_category }}"
@@ -511,6 +586,7 @@
         baseuri: "{{ redfish_auth.baseuri }}"
         username: "{{ redfish_auth.username }}"
         password: "{{ redfish_auth.password }}"
+        validate_certs: "{{ redfish_validate_certs }}"
         resource_id: "{{ redfish_vm_resource_id | default(omit, true) }}"
       failed_when: false
       tags: [deploy]
@@ -522,6 +598,7 @@
         baseuri: "{{ redfish_auth.baseuri }}"
         username: "{{ redfish_auth.username }}"
         password: "{{ redfish_auth.password }}"
+        validate_certs: "{{ redfish_validate_certs }}"
         resource_id: "{{ redfish_vm_resource_id | default(omit, true) }}"
         virtual_media:
           image_url: "{{ iso_image_url }}"

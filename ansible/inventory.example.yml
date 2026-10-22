@@ -33,6 +33,8 @@ all:
 
     # Redfish virtual media (vendor-dependent)
     redfish_vm_category: "Manager"   # or Systems
+    # Required when the BMC has more than one Manager (playbook auto-picks
+    # BMC/iDRAC/1 when possible; otherwise set explicitly):
     # redfish_vm_resource_id: "BMC"  # e.g. BMC, 1, iDRAC.Embedded.1
     # redfish_system_id: "1"
 
