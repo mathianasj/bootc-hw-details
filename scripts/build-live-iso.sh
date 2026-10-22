@@ -165,52 +165,61 @@ for efi_dir in "$ROOTFS"/usr/lib/efi/*/*/EFI "$ROOTFS"/usr/lib/efi/*/EFI; do
   cp -a "$efi_dir"/. "$ISO_ROOT/EFI/" 2>/dev/null || true
 done
 
-# Removable-media BOOTX64.EFI: prefer shim, then any existing BOOTX64, then grubx64.
-bootx64=""
-for candidate in \
-  "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI" \
-  "$ISO_ROOT/EFI/redhat/shimx64.efi" \
-  "$ISO_ROOT/EFI/centos/shimx64.efi" \
-  "$ISO_ROOT/EFI/fedora/shimx64.efi" \
-  "$ROOTFS/boot/efi/EFI/BOOT/BOOTX64.EFI" \
-  "$ROOTFS/boot/efi/EFI/redhat/shimx64.efi" \
-  "$ROOTFS/usr/share/shim/shimx64.efi" \
-  "$ROOTFS/usr/lib/shim/shimx64.efi"
-do
-  if [[ -f "$candidate" ]]; then
-    bootx64="$candidate"
-    break
+# Removable-media BOOTX64.EFI: use what's already staged, else copy shim/grub.
+copy_if_different() {
+  local src="$1" dst="$2"
+  [[ -f "$src" ]] || return 1
+  mkdir -p "$(dirname "$dst")"
+  if [[ -e "$dst" ]] && [[ "$(realpath "$src")" == "$(realpath "$dst")" ]]; then
+    return 0
   fi
-done
-if [[ -z "$bootx64" ]]; then
-  bootx64="$(find "$ISO_ROOT/EFI" "$ROOTFS/boot/efi" "$ROOTFS/usr/lib/efi" "$ROOTFS/usr/share" \
-    \( -iname 'shimx64.efi' -o -iname 'BOOTX64.EFI' \) 2>/dev/null | head -n1 || true)"
+  cp -a "$src" "$dst"
+}
+
+if [[ ! -f "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI" ]]; then
+  bootx64=""
+  for candidate in \
+    "$ISO_ROOT/EFI/redhat/shimx64.efi" \
+    "$ISO_ROOT/EFI/centos/shimx64.efi" \
+    "$ISO_ROOT/EFI/fedora/shimx64.efi" \
+    "$ROOTFS/boot/efi/EFI/BOOT/BOOTX64.EFI" \
+    "$ROOTFS/boot/efi/EFI/redhat/shimx64.efi" \
+    "$ROOTFS/usr/share/shim/shimx64.efi" \
+    "$ROOTFS/usr/lib/shim/shimx64.efi"
+  do
+    if [[ -f "$candidate" ]]; then
+      bootx64="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$bootx64" ]]; then
+    bootx64="$(find "$ISO_ROOT/EFI" "$ROOTFS/boot/efi" "$ROOTFS/usr/lib/efi" "$ROOTFS/usr/share" \
+      \( -iname 'shimx64.efi' -o -iname 'BOOTX64.EFI' \) 2>/dev/null | head -n1 || true)"
+  fi
+  if [[ -z "$bootx64" ]]; then
+    # Last resort: unsigned grub EFI as the removable loader (no Secure Boot).
+    bootx64="$(find "$ISO_ROOT/EFI" "$ROOTFS" -iname 'grubx64.efi' 2>/dev/null | head -n1 || true)"
+  fi
+  if [[ -z "$bootx64" || ! -f "$bootx64" ]]; then
+    echo "EFI loader not found (shimx64.efi / BOOTX64.EFI / grubx64.efi)." >&2
+    echo "Searched under $ROOTFS/boot/efi and $ROOTFS/usr/lib/efi:" >&2
+    find "$ROOTFS/boot/efi" "$ROOTFS/usr/lib/efi" "$ROOTFS/usr/share/shim" \
+      -iname '*.efi' 2>/dev/null | head -n50 >&2 || true
+    exit 1
+  fi
+  copy_if_different "$bootx64" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI"
 fi
-if [[ -z "$bootx64" ]]; then
-  # Last resort: unsigned grub EFI as the removable loader (no Secure Boot).
-  bootx64="$(find "$ISO_ROOT/EFI" "$ROOTFS" -iname 'grubx64.efi' 2>/dev/null | head -n1 || true)"
+# Keep a vendor shim copy when missing.
+if [[ ! -f "$ISO_ROOT/EFI/redhat/shimx64.efi" && -f "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI" ]]; then
+  copy_if_different "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI" "$ISO_ROOT/EFI/redhat/shimx64.efi"
 fi
-if [[ -z "$bootx64" || ! -f "$bootx64" ]]; then
-  echo "EFI loader not found (shimx64.efi / BOOTX64.EFI / grubx64.efi)." >&2
-  echo "Searched under $ROOTFS/boot/efi and $ROOTFS/usr/lib/efi:" >&2
-  find "$ROOTFS/boot/efi" "$ROOTFS/usr/lib/efi" "$ROOTFS/usr/share/shim" \
-    -iname '*.efi' 2>/dev/null | head -n50 >&2 || true
-  exit 1
-fi
-cp -a "$bootx64" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI"
-# Keep a vendor copy when we found shim.
-case "$(basename "$bootx64")" in
-  shimx64.efi|BOOTX64.EFI)
-    cp -a "$bootx64" "$ISO_ROOT/EFI/redhat/shimx64.efi"
-    ;;
-esac
 # Ensure grubx64.efi exists next to shim when available.
 if [[ ! -f "$ISO_ROOT/EFI/redhat/grubx64.efi" ]]; then
   grubefi="$(find "$ISO_ROOT/EFI" "$ROOTFS/boot/efi" "$ROOTFS/usr/lib/grub" \
     -iname 'grubx64.efi' 2>/dev/null | head -n1 || true)"
   if [[ -n "$grubefi" ]]; then
-    cp -a "$grubefi" "$ISO_ROOT/EFI/redhat/grubx64.efi"
-    cp -a "$grubefi" "$ISO_ROOT/EFI/BOOT/grubx64.efi"
+    copy_if_different "$grubefi" "$ISO_ROOT/EFI/redhat/grubx64.efi"
+    copy_if_different "$grubefi" "$ISO_ROOT/EFI/BOOT/grubx64.efi"
   fi
 fi
 
