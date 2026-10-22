@@ -82,41 +82,42 @@ add_dracutmodules+=" dmsquash-live dmsquash-live-autooverlay "
 CONF
 
 # EFI layout expected by the container-native ISO contract.
-# Collect vendor EFI trees from /usr/lib/efi and package paths used on RHEL.
+# In bootc images /boot/efi is often empty even when shim-x64/grub2-efi-x64 are
+# installed. Download the RPMs and extract their EFI payloads with rpm2cpio.
 mkdir -p /boot/efi/EFI/BOOT /boot/efi/EFI/redhat
 for efi_dir in /usr/lib/efi/*/*/EFI /usr/lib/efi/*/EFI; do
   [ -d "${efi_dir}" ] || continue
   cp -ra "${efi_dir}/." /boot/efi/EFI/ 2>/dev/null || true
 done
-# shim-x64 / grub2-efi-x64 often land directly under /boot/efi already on installed
-# systems; in bootc images also check common package file locations.
-for shim in \
-  /boot/efi/EFI/redhat/shimx64.efi \
-  /boot/efi/EFI/BOOT/BOOTX64.EFI \
-  /usr/share/shim/shimx64.efi \
-  /usr/lib/shim/shimx64.efi \
-  /usr/libexec/shim/shimx64.efi
-do
-  if [[ -f "${shim}" ]]; then
-    cp -a "${shim}" /boot/efi/EFI/redhat/shimx64.efi
-    cp -a "${shim}" /boot/efi/EFI/BOOT/BOOTX64.EFI
-    break
-  fi
-done
-for grubefi in \
-  /boot/efi/EFI/redhat/grubx64.efi \
-  /usr/lib/grub/x86_64-efi/monolithic/grubx64.efi \
-  /usr/lib/grub/x86_64-efi-signed/grubx64.efi
-do
-  if [[ -f "${grubefi}" ]]; then
-    cp -a "${grubefi}" /boot/efi/EFI/redhat/grubx64.efi
-    break
-  fi
-done
-# Fail the image build early if we still have no removable-media EFI loader.
+efi_extract="$(mktemp -d)"
+(
+  set -euo pipefail
+  cd "${efi_extract}"
+  dnf -y --setopt=sslverify=0 --setopt=sslverifystatus=0 download \
+    --destdir="${efi_extract}" shim-x64 grub2-efi-x64
+  for rpm in shim-x64*.rpm grub2-efi-x64-*.rpm; do
+    [[ -f "${rpm}" ]] || continue
+    [[ "${rpm}" == *cdboot* ]] && continue
+    rpm2cpio "${rpm}" | cpio -idmu --quiet
+  done
+  test -d boot/efi/EFI
+  cp -a boot/efi/EFI/. /boot/efi/EFI/
+)
+rm -rf "${efi_extract}"
+# Normalize removable-media + vendor paths.
+if [[ -f /boot/efi/EFI/redhat/shimx64.efi && ! -f /boot/efi/EFI/BOOT/BOOTX64.EFI ]]; then
+  cp -a /boot/efi/EFI/redhat/shimx64.efi /boot/efi/EFI/BOOT/BOOTX64.EFI
+fi
+if [[ -f /boot/efi/EFI/BOOT/BOOTX64.EFI && ! -f /boot/efi/EFI/redhat/shimx64.efi ]]; then
+  cp -a /boot/efi/EFI/BOOT/BOOTX64.EFI /boot/efi/EFI/redhat/shimx64.efi
+fi
+if [[ -f /boot/efi/EFI/redhat/grubx64.efi ]]; then
+  cp -a /boot/efi/EFI/redhat/grubx64.efi /boot/efi/EFI/BOOT/grubx64.efi
+fi
 if [[ ! -f /boot/efi/EFI/BOOT/BOOTX64.EFI ]]; then
-  echo "ERROR: no shim/BOOTX64.EFI found after EFI staging; searched:" >&2
-  find /usr/lib/efi /usr/share/shim /usr/lib/shim /boot/efi -iname '*shim*.efi' -o -iname 'BOOTX64.EFI' -o -iname 'grubx64.efi' 2>/dev/null | head >&2 || true
+  echo "ERROR: no BOOTX64.EFI after rpm2cpio EFI staging. Diagnostics:" >&2
+  rpm -q shim-x64 grub2-efi-x64 || true
+  find /boot/efi -iname '*.efi' 2>/dev/null | head -n 40 >&2 || true
   exit 1
 fi
 
