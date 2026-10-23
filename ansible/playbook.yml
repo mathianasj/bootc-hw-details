@@ -638,6 +638,7 @@
 
     # PowerCycle / ForceRestart only work when PowerState is On. A host that is
     # already Off will not boot — read state and PowerOn, or cycle if On.
+    # redfish_info has no resource_id; filter PowerState by system Id when set.
     - name: Read system power state
       community.general.redfish_info:
         category: Systems
@@ -646,7 +647,6 @@
         username: "{{ redfish_auth.username }}"
         password: "{{ redfish_auth.password }}"
         validate_certs: "{{ redfish_validate_certs }}"
-        resource_id: "{{ redfish_system_id | default(omit, true) }}"
       register: system_inventory
       tags: [deploy]
 
@@ -655,15 +655,33 @@
         redfish_power_state: >-
           {{
             (
-              system_inventory.redfish_facts.system.entries
-              | default([])
-              | map('last')
-              | selectattr('PowerState', 'defined')
-              | map(attribute='PowerState')
-              | list
-              | first
-              | default('Unknown')
+              (
+                system_inventory.redfish_facts.system.entries
+                | default([])
+                | map('last')
+                | selectattr('PowerState', 'defined')
+                | selectattr('Id', 'defined')
+                | selectattr('Id', 'equalto', redfish_system_id)
+                | map(attribute='PowerState')
+                | list
+              )
+              if (redfish_system_id | default('') | length) > 0 else []
             )
+            | default([], true)
+            | first
+            | default(
+                (
+                  system_inventory.redfish_facts.system.entries
+                  | default([])
+                  | map('last')
+                  | selectattr('PowerState', 'defined')
+                  | map(attribute='PowerState')
+                  | list
+                  | first
+                  | default('Unknown')
+                ),
+                true
+              )
           }}
       tags: [deploy]
 
