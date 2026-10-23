@@ -48,6 +48,8 @@ def ipmi_session_failed(text: str) -> bool:
         "Error: Unable to establish IPMI",
         "unauthorized name",
         "Get Session Challenge command failed",
+        "SOL payload disabled",
+        "Error activating SOL payload",
     )
     lower = text.lower()
     return any(n.lower() in lower for n in needles)
@@ -531,28 +533,7 @@ def require_ipmitool(path: str) -> None:
         )
 
 
-def deactivate_sol(args: argparse.Namespace) -> None:
-    cmd = [
-        args.ipmitool,
-        "-I",
-        "lanplus",
-        "-H",
-        args.host,
-        "-U",
-        args.username,
-        "-p",
-        str(args.port),
-    ]
-    if args.password:
-        cmd.extend(["-P", args.password])
-    cmd.extend(["sol", "deactivate"])
-    subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
-def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
-    require_ipmitool(args.ipmitool)
-    deactivate_sol(args)
-    time.sleep(1)
+def ipmitool_base(args: argparse.Namespace) -> list[str]:
     cmd = [
         args.ipmitool,
         "-I",
@@ -568,14 +549,121 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
         cmd.extend(["-P", args.password])
     if args.cipher_suite is not None:
         cmd.extend(["-C", str(args.cipher_suite)])
-    cmd.extend(["sol", "activate"])
+    return cmd
+
+
+def run_ipmitool(args: argparse.Namespace, extra: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ipmitool_base(args) + extra,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def deactivate_sol(args: argparse.Namespace) -> None:
+    subprocess.run(
+        ipmitool_base(args) + ["sol", "deactivate"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def lookup_ipmi_user_id(args: argparse.Namespace) -> int | None:
+    """Return IPMI user id for args.username from `user list`, if found."""
+    proc = run_ipmitool(args, ["user", "list"])
+    text = (proc.stdout or "") + (proc.stderr or "")
+    want = args.username.strip().lower()
+    for line in text.splitlines():
+        # ID  Name             Callin  Link Auth  IPMI Msg   Channel Priv Limit
+        parts = line.split()
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        if parts[1].lower() == want:
+            return int(parts[0])
+    return None
+
+
+def enable_sol_payload(args: argparse.Namespace) -> None:
+    """Best-effort enable global SOL and per-user SOL payload.
+
+    "Info: SOL payload disabled" usually means the user lacks SOL payload on
+    the LAN channel — fix with `sol payload enable <channel> <userid>` and
+    often `sol set enabled true`.
+    """
+    sys.stderr.write("Enabling IPMI SOL (set enabled + payload) …\n")
+    for extra in (
+        ["sol", "set", "enabled", "true"],
+        ["sol", "set", "enabled", "true", "1"],
+    ):
+        proc = run_ipmitool(args, extra)
+        if proc.returncode == 0:
+            break
+
+    user_id = lookup_ipmi_user_id(args)
+    user_ids = [user_id] if user_id is not None else []
+    # Common defaults when user list parse fails (ADMIN often id 2).
+    for fallback in (2, 1, 3):
+        if fallback not in user_ids:
+            user_ids.append(fallback)
+
+    channels = [1, 8, 2]
+    for channel in channels:
+        for uid in user_ids:
+            proc = run_ipmitool(
+                args, ["sol", "payload", "enable", str(channel), str(uid)]
+            )
+            out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+            if proc.returncode == 0:
+                sys.stderr.write(
+                    f"  sol payload enable {channel} {uid}: ok\n"
+                )
+            elif out and args.verbose:
+                sys.stderr.write(
+                    f"  sol payload enable {channel} {uid}: {out}\n"
+                )
+
+
+def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
+    require_ipmitool(args.ipmitool)
+    enable_sol_payload(args)
+    deactivate_sol(args)
+    time.sleep(1)
+    cmd = ipmitool_base(args) + ["sol", "activate"]
     env = os.environ.copy()
     env["IPMITOOL_PASSWORD"] = args.password or ""
     buf, code = capture_from_popen(
         cmd, out_path, args.timeout, args.verbose, env=env
     )
     deactivate_sol(args)
-    if ipmi_session_failed(buf):
+
+    if "SOL payload disabled" in buf or "SOL payload disabled" in (
+        Path(out_path).read_text(encoding="utf-8", errors="replace")
+        if out_path.is_file()
+        else ""
+    ):
+        # Retry once after a second enable pass (some BMCs need activate attempt first).
+        sys.stderr.write("SOL payload still disabled; retrying enable + activate …\n")
+        enable_sol_payload(args)
+        deactivate_sol(args)
+        time.sleep(1)
+        buf, code = capture_from_popen(
+            cmd, out_path, args.timeout, args.verbose, env=env
+        )
+        deactivate_sol(args)
+
+    if ipmi_session_failed(buf) or (
+        out_path.is_file()
+        and ipmi_session_failed(
+            out_path.read_text(encoding="utf-8", errors="replace")
+        )
+    ):
+        sys.stderr.write(
+            "ERROR: IPMI SOL unavailable (session/payload). "
+            "Try: ipmitool … sol payload enable 1 <userid> "
+            "or sol_transport=redfish|auto\n"
+        )
         return buf, 4
     return buf, code
 
@@ -718,7 +806,9 @@ def capture(args: argparse.Namespace) -> int:
             return last_code
         # code 3/4 or empty timeout: try next transport if any
 
-    if last_buf:
+    if extract_report(last_buf) is not None:
+        return finalize(last_buf, out_path, report_path)
+    if last_buf and last_code not in (4,):
         return finalize(last_buf, out_path, report_path)
     return last_code
 

@@ -135,6 +135,14 @@ ipmitool -I lanplus -H <bmc> -U admin -P "$REDFISH_PASSWORD" sol info
 
 Check: IPMI-over-LAN enabled, SOL enabled, UDP/623 allowed, and IPMI user/password (may differ from Redfish). Cipher issues sometimes need `-C 17`.
 
+If capture fails with `Info: SOL payload disabled`, enable SOL for the IPMI user (the playbook/script tries this automatically):
+
+```bash
+ipmitool -I lanplus -H <bmc> -U admin -P "$REDFISH_PASSWORD" user list
+ipmitool -I lanplus -H <bmc> -U admin -P "$REDFISH_PASSWORD" sol set enabled true
+ipmitool -I lanplus -H <bmc> -U admin -P "$REDFISH_PASSWORD" sol payload enable 1 <userid>
+```
+
 Optional: `sol_transport=redfish` discovers Redfish `SerialConsole` (SSH / OpenBMC `/console0`); `auto` tries IPMI then Redfish.
 
 ## Manual build (live ISO)
