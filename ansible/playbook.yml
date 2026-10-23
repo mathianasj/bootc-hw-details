@@ -55,6 +55,9 @@
     ipmi_username: "{{ redfish_username }}"
     ipmi_password: "{{ redfish_password }}"
     ipmi_port: 623
+    # Serial scrape transport: ipmi (ipmitool SOL; default), redfish
+    # (SSH/websocket via Redfish discovery), or auto (ipmi then redfish).
+    sol_transport: ipmi
 
     iso_http_bind: "0.0.0.0"
     iso_http_port: 8080
@@ -648,24 +651,44 @@
       tags: [deploy, capture]
 
     # ----------------------------------------------------------- SOL capture
-    - name: Ensure ipmitool is installed for SOL capture
+    - name: Ensure ipmitool is installed for IPMI SOL capture
       ansible.builtin.command:
         cmd: sudo dnf install -y ipmitool
-      when: ansible_os_family == 'RedHat'
+      when:
+        - ansible_os_family == 'RedHat'
+        - sol_transport | default('ipmi') in ['ipmi', 'auto']
       tags: [capture]
       changed_when: true
+
+    - name: Ensure SSH tools for Redfish serial capture
+      ansible.builtin.command:
+        cmd: sudo dnf install -y openssh-clients sshpass
+      when:
+        - ansible_os_family == 'RedHat'
+        - sol_transport | default('ipmi') in ['redfish', 'auto']
+      tags: [capture]
+      changed_when: true
+      failed_when: false
 
     - name: Capture serial console until hw-gather markers
       ansible.builtin.command:
         argv:
           - python3
           - "{{ sol_capture_script }}"
+          - --transport
+          - "{{ sol_transport | default('ipmi') }}"
           - --host
           - "{{ redfish_bmc_host }}"
           - --username
           - "{{ ipmi_username }}"
           - --password
           - "{{ ipmi_password }}"
+          - --redfish-baseuri
+          - "{{ redfish_baseuri }}"
+          - --redfish-system-id
+          - "{{ redfish_system_id | default('') }}"
+          - --redfish-manager-id
+          - "{{ redfish_vm_resource_id | default('') }}"
           - --port
           - "{{ ipmi_port | string }}"
           - --timeout
@@ -678,6 +701,7 @@
       register: sol_capture
       environment:
         IPMI_PASSWORD: "{{ ipmi_password }}"
+        REDFISH_PASSWORD: "{{ redfish_password }}"
       tags: [capture]
 
     - name: Show parsed hw-gather report

@@ -41,3 +41,5 @@ all:
     # Timing (live boot — no Anaconda)
     sol_timeout_seconds: 900
     post_reboot_settle_seconds: 45
+    # Serial scrape: ipmi (default), redfish (SSH/websocket), or auto
+    # sol_transport: ipmi

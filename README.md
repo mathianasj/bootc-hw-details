@@ -84,7 +84,7 @@ ansible-playbook -i inventory.yml playbook.yml \
   -e redfish_username=admin
 ```
 
-`redfish_address` can be a host, `host:port`, or a full `https://…/redfish/v1/Systems/<id>` URL. The playbook sends `host:port` to the Redfish modules and uses the UUID as the system id. Serial capture still uses IPMI on the host (port 623), not the Redfish port.
+`redfish_address` can be a host, `host:port`, or a full `https://…/redfish/v1/Systems/<id>` URL. The playbook sends `host:port` to the Redfish modules and uses the UUID as the system id. Serial capture uses IPMI SOL on the BMC host (port 623) by default; set `sol_transport=redfish` or `auto` for Redfish SSH/websocket instead.
 
 Skip rebuild on later runs:
 
@@ -122,8 +122,20 @@ Tags: `build`, `deploy`, `capture`.
 | `iso_http_host` | Address the **BMC** uses to fetch the ISO (not `127.0.0.1`) |
 | `iso_http_port` | Default `8080` — open in firewall toward the BMC |
 | `sol_timeout_seconds` | Default `900` (live boot + LLDP wait) |
+| `sol_transport` | `ipmi` (default), `redfish`, or `auto` |
 
-SOL uses **IPMI-over-LAN** (`ipmitool sol activate`) against the same BMC address/creds by default. Enable IPMI/SOL on the BMC if it is disabled.
+SOL uses **IPMI-over-LAN** (`ipmitool sol activate`) against the same BMC address/creds by default. Enable IPMI/SOL on the BMC if it is disabled (Redfish working does **not** imply IPMI is on).
+
+If capture fails with `Unable to establish IPMI v2 / RMCP+ session`:
+
+```bash
+# From the control node — should print SOL info, not an RMCP+ error
+ipmitool -I lanplus -H <bmc> -U admin -P "$REDFISH_PASSWORD" sol info
+```
+
+Check: IPMI-over-LAN enabled, SOL enabled, UDP/623 allowed, and IPMI user/password (may differ from Redfish). Cipher issues sometimes need `-C 17`.
+
+Optional: `sol_transport=redfish` discovers Redfish `SerialConsole` (SSH / OpenBMC `/console0`); `auto` tries IPMI then Redfish.
 
 ## Manual build (live ISO)
 
