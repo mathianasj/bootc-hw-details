@@ -632,7 +632,56 @@
         baseuri: "{{ redfish_auth.baseuri }}"
         username: "{{ redfish_auth.username }}"
         password: "{{ redfish_auth.password }}"
+        validate_certs: "{{ redfish_validate_certs }}"
         resource_id: "{{ redfish_system_id | default(omit, true) }}"
+      tags: [deploy]
+
+    # PowerCycle / ForceRestart only work when PowerState is On. A host that is
+    # already Off will not boot — read state and PowerOn, or cycle if On.
+    - name: Read system power state
+      community.general.redfish_info:
+        category: Systems
+        command: GetSystemInventory
+        baseuri: "{{ redfish_auth.baseuri }}"
+        username: "{{ redfish_auth.username }}"
+        password: "{{ redfish_auth.password }}"
+        validate_certs: "{{ redfish_validate_certs }}"
+        resource_id: "{{ redfish_system_id | default(omit, true) }}"
+      register: system_inventory
+      tags: [deploy]
+
+    - name: Set fact for Redfish PowerState
+      ansible.builtin.set_fact:
+        redfish_power_state: >-
+          {{
+            (
+              system_inventory.redfish_facts.system.entries
+              | default([])
+              | map('last')
+              | selectattr('PowerState', 'defined')
+              | map(attribute='PowerState')
+              | list
+              | first
+              | default('Unknown')
+            )
+          }}
+      tags: [deploy]
+
+    - name: Show system power state before boot
+      ansible.builtin.debug:
+        msg: "PowerState={{ redfish_power_state }}"
+      tags: [deploy]
+
+    - name: Power on system to boot live ISO
+      community.general.redfish_command:
+        category: Systems
+        command: PowerOn
+        baseuri: "{{ redfish_auth.baseuri }}"
+        username: "{{ redfish_auth.username }}"
+        password: "{{ redfish_auth.password }}"
+        validate_certs: "{{ redfish_validate_certs }}"
+        resource_id: "{{ redfish_system_id | default(omit, true) }}"
+      when: (redfish_power_state | string | lower) == 'off'
       tags: [deploy]
 
     - name: Power cycle system to boot live ISO
@@ -642,7 +691,41 @@
         baseuri: "{{ redfish_auth.baseuri }}"
         username: "{{ redfish_auth.username }}"
         password: "{{ redfish_auth.password }}"
+        validate_certs: "{{ redfish_validate_certs }}"
         resource_id: "{{ redfish_system_id | default(omit, true) }}"
+      when: (redfish_power_state | string | lower) == 'on'
+      tags: [deploy]
+
+    # PowerOn is a no-op when already On — if state is unknown, force off then on.
+    - name: Force power off when PowerState is unknown
+      community.general.redfish_command:
+        category: Systems
+        command: PowerForceOff
+        baseuri: "{{ redfish_auth.baseuri }}"
+        username: "{{ redfish_auth.username }}"
+        password: "{{ redfish_auth.password }}"
+        validate_certs: "{{ redfish_validate_certs }}"
+        resource_id: "{{ redfish_system_id | default(omit, true) }}"
+      when: (redfish_power_state | string | lower) not in ['on', 'off']
+      failed_when: false
+      tags: [deploy]
+
+    - name: Wait after forced power off
+      ansible.builtin.pause:
+        seconds: 10
+      when: (redfish_power_state | string | lower) not in ['on', 'off']
+      tags: [deploy]
+
+    - name: Power on after unknown PowerState
+      community.general.redfish_command:
+        category: Systems
+        command: PowerOn
+        baseuri: "{{ redfish_auth.baseuri }}"
+        username: "{{ redfish_auth.username }}"
+        password: "{{ redfish_auth.password }}"
+        validate_certs: "{{ redfish_validate_certs }}"
+        resource_id: "{{ redfish_system_id | default(omit, true) }}"
+      when: (redfish_power_state | string | lower) not in ['on', 'off']
       tags: [deploy]
 
     - name: Wait for firmware / live boot to start

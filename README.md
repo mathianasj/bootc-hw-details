@@ -25,7 +25,7 @@ End-to-end flow on the control node:
 1. Build the bootc image (live-capable initramfs + `iso.yaml`)
 2. Build a **live** ISO with `scripts/build-live-iso.sh` (dmsquash live ISO; no Anaconda / no disk install)
 3. Serve the ISO over HTTP (BMC must reach the control node)
-4. Mount it with Redfish virtual media, one-time boot to CD, power cycle
+4. Mount it with Redfish virtual media, one-time boot to CD, then PowerOn (if Off) or PowerCycle (if On)
 5. Attach IPMI SOL, wait for `###HW-GATHER-BEGIN###` … `###HW-GATHER-END###`
 6. Write the parsed report under `output/captures/<bmc>/`
 
