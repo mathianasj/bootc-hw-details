@@ -648,6 +648,13 @@
       tags: [deploy, capture]
 
     # ----------------------------------------------------------- SOL capture
+    - name: Ensure ipmitool is installed for SOL capture
+      ansible.builtin.command:
+        cmd: sudo dnf install -y ipmitool
+      when: ansible_os_family == 'RedHat'
+      tags: [capture]
+      changed_when: true
+
     - name: Capture serial console until hw-gather markers
       ansible.builtin.command:
         argv:

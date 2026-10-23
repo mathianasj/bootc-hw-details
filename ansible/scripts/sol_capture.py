@@ -43,6 +43,16 @@ def build_ipmitool_cmd(args: argparse.Namespace) -> list[str]:
     return cmd
 
 
+def require_ipmitool(path: str) -> None:
+    from shutil import which
+
+    if which(path) is None and not Path(path).is_file():
+        raise SystemExit(
+            f"ipmitool not found ({path!r}). Install it on the control node "
+            "(e.g. sudo dnf install -y ipmitool)."
+        )
+
+
 def deactivate_sol(args: argparse.Namespace) -> None:
     cmd = [
         args.ipmitool,
@@ -72,6 +82,7 @@ def capture(args: argparse.Namespace) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
+    require_ipmitool(args.ipmitool)
     deactivate_sol(args)
     time.sleep(1)
 
