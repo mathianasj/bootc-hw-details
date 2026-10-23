@@ -546,6 +546,16 @@
         - (_mgr_ids | default([]) | length) == 1
       tags: [deploy]
 
+    - name: Prefer Manager Id matching the Systems UUID when several exist
+      ansible.builtin.set_fact:
+        redfish_vm_resource_id: "{{ redfish_system_id }}"
+      when:
+        - (redfish_vm_resource_id | default('') | length) == 0
+        - (_mgr_ids | default([]) | length) > 1
+        - (redfish_system_id | default('') | length) > 0
+        - redfish_system_id in (_mgr_ids | default([]))
+      tags: [deploy]
+
     - name: Prefer a BMC-like Manager Id when several exist
       ansible.builtin.set_fact:
         redfish_vm_resource_id: "{{ _preferred_mgr | first }}"
@@ -568,7 +578,8 @@
         msg: >-
           Multiple (or zero) Redfish Managers found and redfish_vm_resource_id
           is unset. Set -e redfish_vm_resource_id=<Id> (examples: BMC, 1,
-          iDRAC.Embedded.1). Discovered Ids: {{ _mgr_ids | default([]) }}.
+          iDRAC.Embedded.1, or the Systems UUID). Discovered Ids:
+          {{ _mgr_ids | default([]) }}.
       when:
         - redfish_vm_category | default('Manager') == 'Manager'
         - (redfish_vm_resource_id | default('') | length) == 0

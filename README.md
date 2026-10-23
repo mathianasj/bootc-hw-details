@@ -117,7 +117,7 @@ Tags: `build`, `deploy`, `capture`.
 | `image_builder_image` | Container CLI image when `iso_builder_mode=container` |
 | `bootc_build_ref` | Optional separate buildroot; empty uses `image_name` |
 | `redfish_vm_category` | `Manager` (default) or `Systems` |
-| `redfish_vm_resource_id` | Manager Id for virtual media (e.g. `BMC`, `1`, `iDRAC.Embedded.1`). Auto-discovered when unset; required if multiple Managers and none look like BMC/iDRAC |
+| `redfish_vm_resource_id` | Manager Id for virtual media (e.g. `BMC`, `1`, `iDRAC.Embedded.1`). Auto-discovered when unset: sole Manager, then Id matching `redfish_system_id`, then BMC/iDRAC-like names |
 | `redfish_system_id` | System resource for boot/power |
 | `iso_http_host` | Address the **BMC** uses to fetch the ISO (not `127.0.0.1`) |
 | `iso_http_port` | Default `8080` — open in firewall toward the BMC |
