@@ -4,13 +4,16 @@ Documentation=file:///usr/libexec/hw-gather/gather.sh
 After=network-online.target lldpd.service
 Wants=network-online.target
 Requires=lldpd.service
+# Keep agetty off the BMC UART for the whole oneshot so the scrape block
+# is not stolen / EBUSY'd by serial-getty (Restart=always).
+Conflicts=serial-getty@ttyS0.service serial-getty@ttyS1.service serial-getty@ttyAMA0.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/libexec/hw-gather/gather.sh
 RemainAfterExit=yes
-# Allow time for LLDP advertisements from the switch.
-TimeoutStartSec=180
+# LLDP wait + inventory; smartctl must not hang past this.
+TimeoutStartSec=300
 # Avoid interleaving unit stdout with the scrape block; the script writes
 # the full marked report directly to serial devices.
 StandardOutput=journal

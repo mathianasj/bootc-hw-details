@@ -69,8 +69,9 @@ wait_for_lldp() {
   log "Timed out waiting for LLDP neighbors (switches must have LLDP enabled)"
 }
 
-# Resolve devices that Redfish SOL / BMC serial typically mirrors.
-# Prefer kernel console= devices from /proc/cmdline, then common UART names.
+# Resolve BMC UART devices Redfish SOL / VirtualBMC typically mirror.
+# Prefer console= UARTs from the cmdline; never treat /dev/console as enough
+# on its own (with console=tty0,console=ttyS0 writes often go to VGA only).
 serial_targets() {
   local -a found=()
   local token dev
@@ -87,8 +88,7 @@ serial_targets() {
     done
   fi
 
-  # Always try the kernel console device and common BMC UART paths.
-  found+=("/dev/console" "/dev/ttyS0" "/dev/ttyS1" "/dev/ttyAMA0")
+  found+=("/dev/ttyS0" "/dev/ttyS1" "/dev/ttyAMA0")
 
   printf '%s\n' "${found[@]}" | awk 'NF && !seen[$0]++'
 }
@@ -106,25 +106,38 @@ emit_to_serial() {
   local path="$1"
   local target
   local wrote=0
+  local rc=0
 
   stop_serial_gettys
-  # Let the port settle after getty release.
-  sleep 1
+  # Let the port settle after getty release / Conflicts= stop.
+  sleep 2
 
   while IFS= read -r target; do
     [[ -e "${target}" ]] || continue
-    # Best-effort: ignore stty failures on non-tty nodes.
-    stty -F "${target}" raw -echo 2>/dev/null || true
-    if cat "${path}" >"${target}" 2>/dev/null; then
+    [[ -c "${target}" ]] || continue
+    stty -F "${target}" raw -echo 115200 2>/dev/null || true
+    if cat "${path}" >"${target}"; then
       wrote=1
+      printf 'hw-gather: wrote scrape block to %s\n' "${target}" >&2
+    else
+      rc=$?
+      printf 'hw-gather: write to %s failed (exit %s)\n' "${target}" "${rc}" >&2
     fi
   done < <(serial_targets)
 
-  # Last resort: kernel console (often the same UART under console=ttyS0).
-  if [[ "${wrote}" -eq 0 ]] && [[ -e /dev/console ]]; then
-    cat "${path}" >/dev/console 2>/dev/null || true
+  if [[ "${wrote}" -eq 0 ]]; then
+    printf 'hw-gather: ERROR no serial UART accepted the scrape block\n' >&2
+    return 1
   fi
+  return 0
 }
+
+# Claim the UART immediately so getty cannot hold it during the long LLDP wait.
+stop_serial_gettys
+for _t in $(serial_targets); do
+  [[ -c "${_t}" ]] || continue
+  printf '\nhw-gather: collecting inventory (markers follow when done)…\n' >"${_t}" 2>/dev/null || true
+done
 
 : >"${REPORT}"
 
@@ -148,7 +161,9 @@ if command -v smartctl >/dev/null 2>&1; then
     [[ -z "${disk}" ]] && continue
     log ""
     log "--- ${disk} ---"
-    smartctl -i -H "${disk}" >>"${REPORT}" 2>&1 || true
+    # virtio / empty QEMU disks can hang smartctl; never block emit.
+    timeout 8 smartctl -i -H "${disk}" >>"${REPORT}" 2>&1 || \
+      log "(smartctl skipped or timed out on ${disk})"
   done < <(lsblk -dn -o NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}')
 fi
 
@@ -198,8 +213,9 @@ ln -sfn "${REPORT}" "${LATEST}"
 } >"${SERIAL_BLOCK}"
 
 emit_to_serial "${SERIAL_BLOCK}"
+emit_rc=$?
 
-# Also keep a copy in the journal for debugging.
+# Also keep a copy in the journal for debugging (includes markers).
 systemd-cat -t hw-gather <"${SERIAL_BLOCK}" 2>/dev/null || true
 
-exit 0
+exit "${emit_rc}"
