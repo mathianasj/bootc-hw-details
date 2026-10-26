@@ -300,10 +300,15 @@ def capture_from_popen(
 
         # Partial line carry; select-based reader returns "" when idle.
         carry = ""
-        last_keepalive = time.monotonic()
+        # VirtualBMC often needs a client TX before any guest RX. Pump CR only
+        # until the first real console byte, then stop — continuous CR during
+        # early kernel printk saturates SOL (blank-line storms + truncated /
+        # corrupted lines, stream dies mid-boot before userspace).
+        last_rx = time.monotonic()
+        keepalive_armed = keepalive is not None
 
         def read_line() -> str | None:
-            nonlocal carry, last_keepalive
+            nonlocal carry, last_rx, keepalive_armed
             assert proc is not None and master_fd is not None
             if proc.poll() is not None:
                 # Drain remaining PTY data after exit.
@@ -326,14 +331,15 @@ def capture_from_popen(
                 return None
             if not ready:
                 if (
-                    keepalive
-                    and (time.monotonic() - last_keepalive) >= keepalive_interval
+                    keepalive_armed
+                    and keepalive
+                    and (time.monotonic() - last_rx) >= keepalive_interval
                 ):
                     try:
                         os.write(master_fd, keepalive)
                     except OSError:
                         pass
-                    last_keepalive = time.monotonic()
+                    last_rx = time.monotonic()
                 return ""
             try:
                 chunk = os.read(master_fd, 4096)
@@ -344,7 +350,21 @@ def capture_from_popen(
                     out, carry = carry, ""
                     return out
                 return None
-            carry += chunk.decode("utf-8", errors="replace")
+            last_rx = time.monotonic()
+            text = chunk.decode("utf-8", errors="replace")
+            # Ignore SOL banner / our own CR echoes when deciding to disarm.
+            if keepalive_armed and any(
+                s in text
+                for s in (
+                    "BdsDxe",
+                    "GRUB",
+                    "Linux version",
+                    "EFI stub",
+                    "hw-gather",
+                )
+            ):
+                keepalive_armed = False
+            carry += text
             if "\n" in carry:
                 line, _, carry = carry.partition("\n")
                 return line + "\n"
@@ -731,11 +751,10 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
     cmd = ipmitool_base(args) + ["sol", "activate"]
     env = os.environ.copy()
     env["IPMITOOL_PASSWORD"] = args.password or ""
-    # VirtualBMC: guest serial RX often stalls until the client transmits
-    # (same as holding Enter in an interactive sol activate session).
+    # VirtualBMC: need a client TX to start RX; stop CR once firmware/GRUB
+    # appears so we don't saturate SOL during kernel boot.
     sys.stderr.write(
-        "IPMI SOL keepalive: sending CR every 0.5s so VirtualBMC keeps "
-        "streaming guest output\n"
+        "IPMI SOL keepalive: CR until first firmware/GRUB/kernel byte\n"
     )
     buf, code = capture_from_popen(
         cmd,
@@ -744,7 +763,7 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
         args.verbose,
         env=env,
         keepalive=b"\r",
-        keepalive_interval=0.5,
+        keepalive_interval=2.0,
     )
     deactivate_sol(args)
 
@@ -767,7 +786,7 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
             args.verbose,
             env=env,
             keepalive=b"\r",
-            keepalive_interval=0.5,
+            keepalive_interval=2.0,
         )
         deactivate_sol(args)
 
@@ -921,6 +940,18 @@ def capture(args: argparse.Namespace) -> int:
         if last_code == 2 and BEGIN in last_buf:
             # Saw begin marker but not a complete report — don't switch transport.
             return last_code
+        # IPMI already delivered a real console stream (kernel/GRUB) but no
+        # markers — Redfish SerialConsole will not help on VirtualBMC/sushy.
+        if (
+            kind == "ipmi"
+            and last_code == 2
+            and ("Linux version" in last_buf or "GRUB" in last_buf)
+        ):
+            sys.stderr.write(
+                "IPMI SOL saw console output but no hw-gather markers; "
+                "skipping Redfish fallback\n"
+            )
+            break
         # code 3/4 or empty timeout: try next transport if any
 
     if extract_report(last_buf) is not None:

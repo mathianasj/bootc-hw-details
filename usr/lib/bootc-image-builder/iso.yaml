@@ -4,12 +4,13 @@
 # /proc inside LiveOS/squashfs.img — see scripts/build-live-iso.sh).
 label: HWGATHER
 grub2:
+  # Prefer serial-primary console for Redfish/VirtualBMC SOL scrape.
   default: 0
-  timeout: 3
+  timeout: 1
   entries:
-    - name: "hw-gather (live)"
-      linux: "/images/pxeboot/vmlinuz root=live:CDLABEL=HWGATHER rd.live.image rd.live.overlay.overlayfs=1 console=tty0 console=ttyS0,115200n8 enforcing=0"
-      initrd: "/images/pxeboot/initrd.img"
-    - name: "hw-gather (live, serial only)"
+    - name: "hw-gather (live, serial primary)"
       linux: "/images/pxeboot/vmlinuz root=live:CDLABEL=HWGATHER rd.live.image rd.live.overlay.overlayfs=1 console=ttyS0,115200n8 console=tty0 enforcing=0"
+      initrd: "/images/pxeboot/initrd.img"
+    - name: "hw-gather (live, graphics primary)"
+      linux: "/images/pxeboot/vmlinuz root=live:CDLABEL=HWGATHER rd.live.image rd.live.overlay.overlayfs=1 console=tty0 console=ttyS0,115200n8 enforcing=0"
       initrd: "/images/pxeboot/initrd.img"
