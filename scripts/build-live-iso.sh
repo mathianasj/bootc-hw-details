@@ -252,24 +252,33 @@ for vendor_dir in "$ISO_ROOT"/EFI/*/; do
 done
 
 echo "==> creating squashfs (this takes a while)"
-# dmsquash-live treats squashfs as a direct rootfs only if /proc exists as a
-# *directory* inside the image (see dmsquash-live-root.sh). Excluding bare
-# "proc"/"sys"/"dev" removes those dirs and boot dies with:
+# dmsquash-live (rd.live.image + overlayfs) accepts a squashfs as the root only
+# if /proc exists as a directory inside it. Excluding bare "proc" removes the
+# dir and boot dies with:
 #   Failed to find a root filesystem in .../LiveOS/squashfs.img
-# Use a writable overlay so we can ensure empty dirs even when ROOTFS is RO
-# (podman mount), and exclude contents with -wildcards, not the dirs.
+# Also: if LiveOS/ exists inside the squashfs without rootfs.img, dracut takes
+# that branch and never falls through to the /proc check — exclude it.
+#
+# Writable overlay (ROOTFS from podman mount is RO) + mksquashfs -p to force
+# empty mountpoint dirs, then verify before writing the ISO.
 SQ_UPPER="$WORKDIR/sq-upper"
 SQ_WORK="$WORKDIR/sq-work"
 SQ_MNT="$WORKDIR/sq-mnt"
-rm -rf "$SQ_UPPER" "$SQ_WORK" "$SQ_MNT"
+SQ_CHECK="$WORKDIR/sq-check"
+rm -rf "$SQ_UPPER" "$SQ_WORK" "$SQ_MNT" "$SQ_CHECK"
 mkdir -p "$SQ_UPPER" "$SQ_WORK" "$SQ_MNT"
 mount -t overlay overlay \
   -o "lowerdir=${ROOTFS},upperdir=${SQ_UPPER},workdir=${SQ_WORK}" \
   "$SQ_MNT"
+# Clear any accidental nested live layout from the container tree.
+rm -rf "$SQ_MNT/LiveOS"
 mkdir -p "$SQ_MNT"/{proc,sys,dev,run,tmp,var/tmp}
+# -p forces empty dirs into the image even if excludes/mountpoints confuse mksquashfs.
 mksquashfs "$SQ_MNT" "$ISO_ROOT/LiveOS/squashfs.img" \
   -noappend -comp xz -Xbcj x86 -b 1M -processors "$(nproc)" \
   -wildcards \
+  -e 'LiveOS' \
+  -e 'LiveOS/*' \
   -e 'boot/efi' \
   -e 'boot/efi/*' \
   -e 'proc/*' \
@@ -283,9 +292,33 @@ mksquashfs "$SQ_MNT" "$ISO_ROOT/LiveOS/squashfs.img" \
   -e 'var/cache' \
   -e 'var/cache/*' \
   -e 'var/lib/containers' \
-  -e 'var/lib/containers/*'
+  -e 'var/lib/containers/*' \
+  -p 'proc d 755 0 0' \
+  -p 'sys d 755 0 0' \
+  -p 'dev d 755 0 0' \
+  -p 'run d 755 0 0' \
+  -p 'tmp d 755 0 0'
 umount "$SQ_MNT"
 SQ_MNT=""
+
+echo "==> verifying squashfs is a dmsquash-compatible root (/proc present)"
+mkdir -p "$SQ_CHECK"
+mount -o loop,ro "$ISO_ROOT/LiveOS/squashfs.img" "$SQ_CHECK"
+if [[ -d "$SQ_CHECK/LiveOS" && ! -f "$SQ_CHECK/LiveOS/rootfs.img" && ! -f "$SQ_CHECK/LiveOS/ext3fs.img" ]]; then
+  echo "ERROR: squashfs contains LiveOS/ without rootfs.img (dmsquash will fail)." >&2
+  ls -la "$SQ_CHECK/LiveOS" >&2 || true
+  umount "$SQ_CHECK" || true
+  exit 1
+fi
+if [[ ! -d "$SQ_CHECK/proc" ]]; then
+  echo "ERROR: squashfs missing /proc — dmsquash-live cannot use it as root." >&2
+  echo "Top of squashfs:" >&2
+  ls -la "$SQ_CHECK" >&2 || true
+  umount "$SQ_CHECK" || true
+  exit 1
+fi
+umount "$SQ_CHECK"
+echo "    ok: /proc present in LiveOS/squashfs.img"
 
 echo "==> building EFI boot image"
 EFI_IMG="$WORKDIR/efiboot.img"
