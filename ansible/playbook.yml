@@ -822,6 +822,28 @@
         resource_id: "{{ redfish_system_id | default(omit, true) }}"
       tags: [deploy]
 
+    # ----------------------------------------------------------- SOL capture
+    # Attach SOL *before* PowerOn. Activating after settle only catches an idle
+    # login prompt (sol-raw.log stuck at "SOL Session operational").
+    - name: Ensure ipmitool is installed for IPMI SOL capture
+      ansible.builtin.command:
+        cmd: sudo dnf install -y ipmitool
+      when:
+        - ansible_os_family == 'RedHat'
+        - sol_transport | default('auto') in ['ipmi', 'auto']
+      tags: [capture]
+      changed_when: true
+
+    - name: Ensure SSH tools for Redfish serial capture
+      ansible.builtin.command:
+        cmd: sudo dnf install -y openssh-clients sshpass
+      when:
+        - ansible_os_family == 'RedHat'
+        - sol_transport | default('auto') in ['redfish', 'auto']
+      tags: [capture]
+      changed_when: true
+      failed_when: false
+
     # sushy-emulator InsertMedia updates the *inactive* libvirt domain XML
     # (defineXML). PowerCycle / soft reset keeps the live CDROM empty, so the
     # guest never sees the ISO. Always ForceOff then PowerOn so start loads
@@ -843,43 +865,7 @@
         seconds: 10
       tags: [deploy]
 
-    - name: Power on system to boot live ISO
-      community.general.redfish_command:
-        category: Systems
-        command: PowerOn
-        baseuri: "{{ redfish_auth.baseuri }}"
-        username: "{{ redfish_auth.username }}"
-        password: "{{ redfish_auth.password }}"
-        validate_certs: "{{ redfish_validate_certs }}"
-        resource_id: "{{ redfish_system_id | default(omit, true) }}"
-      tags: [deploy]
-
-    - name: Wait for firmware / live boot to start
-      ansible.builtin.pause:
-        seconds: "{{ post_reboot_settle_seconds }}"
-      tags: [deploy, capture]
-
-    # ----------------------------------------------------------- SOL capture
-    - name: Ensure ipmitool is installed for IPMI SOL capture
-      ansible.builtin.command:
-        cmd: sudo dnf install -y ipmitool
-      when:
-        - ansible_os_family == 'RedHat'
-        - sol_transport | default('auto') in ['ipmi', 'auto']
-      tags: [capture]
-      changed_when: true
-
-    - name: Ensure SSH tools for Redfish serial capture
-      ansible.builtin.command:
-        cmd: sudo dnf install -y openssh-clients sshpass
-      when:
-        - ansible_os_family == 'RedHat'
-        - sol_transport | default('auto') in ['redfish', 'auto']
-      tags: [capture]
-      changed_when: true
-      failed_when: false
-
-    - name: Capture serial console until hw-gather markers
+    - name: Start serial capture before PowerOn
       ansible.builtin.command:
         argv:
           - python3
@@ -907,15 +893,44 @@
           - --report
           - "{{ capture_dir }}/hw-gather-report.txt"
           - --verbose
-      register: sol_capture
+      async: "{{ (sol_timeout_seconds | int) + 120 }}"
+      poll: 0
+      register: sol_async
       environment:
         IPMI_PASSWORD: "{{ ipmi_password }}"
         REDFISH_PASSWORD: "{{ redfish_password }}"
       tags: [capture]
 
+    - name: Wait for SOL session to activate
+      ansible.builtin.pause:
+        seconds: 5
+      tags: [deploy, capture]
+
+    - name: Power on system to boot live ISO
+      community.general.redfish_command:
+        category: Systems
+        command: PowerOn
+        baseuri: "{{ redfish_auth.baseuri }}"
+        username: "{{ redfish_auth.username }}"
+        password: "{{ redfish_auth.password }}"
+        validate_certs: "{{ redfish_validate_certs }}"
+        resource_id: "{{ redfish_system_id | default(omit, true) }}"
+      tags: [deploy]
+
+    - name: Wait for serial capture until hw-gather markers
+      ansible.builtin.async_status:
+        jid: "{{ sol_async.ansible_job_id }}"
+      register: sol_capture
+      until: sol_capture.finished
+      retries: "{{ ((sol_timeout_seconds | int) / 10) | int + 24 }}"
+      delay: 10
+      when: sol_async.ansible_job_id is defined
+      tags: [capture]
+
     - name: Show parsed hw-gather report
       ansible.builtin.debug:
         var: sol_capture.stdout
+      when: sol_capture is defined
       tags: [capture]
 
     - name: Confirm report files on control node

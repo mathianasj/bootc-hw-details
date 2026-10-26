@@ -264,37 +264,87 @@ def capture_from_popen(
     env: dict[str, str] | None = None,
     stdin_text: str | None = None,
 ) -> tuple[str, int]:
-    proc: subprocess.Popen[str] | None = None
+    """Run cmd and scrape stdout until markers.
+
+    Uses a PTY so ipmitool SOL can tcsetattr (avoids ``Inappropriate ioctl``
+    and some BMCs dropping data on a plain pipe). Reads with ``select`` so an
+    idle SOL session cannot block past ``timeout`` on ``readline()``.
+    """
+    import pty
+    import select
+
+    master_fd: int | None = None
+    slave_fd: int | None = None
+    proc: subprocess.Popen[bytes] | None = None
     try:
+        master_fd, slave_fd = pty.openpty()
         proc = subprocess.Popen(
             cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
             env=env or os.environ.copy(),
+            close_fds=True,
         )
-        assert proc.stdout is not None
-        if stdin_text and proc.stdin:
-            proc.stdin.write(stdin_text)
-            proc.stdin.flush()
+        os.close(slave_fd)
+        slave_fd = None
+
+        if stdin_text:
+            os.write(master_fd, stdin_text.encode())
+
+        # Partial line carry; select-based reader returns "" when idle.
+        carry = ""
 
         def read_line() -> str | None:
-            assert proc is not None and proc.stdout is not None
+            nonlocal carry
+            assert proc is not None and master_fd is not None
             if proc.poll() is not None:
-                rest = proc.stdout.read()
-                return rest if rest else None
-            return proc.stdout.readline()
+                # Drain remaining PTY data after exit.
+                try:
+                    ready, _, _ = select.select([master_fd], [], [], 0.2)
+                    if ready:
+                        chunk = os.read(master_fd, 4096).decode(
+                            "utf-8", errors="replace"
+                        )
+                        carry += chunk
+                except OSError:
+                    pass
+                if carry:
+                    out, carry = carry, ""
+                    return out
+                return None
+            try:
+                ready, _, _ = select.select([master_fd], [], [], 0.5)
+            except (OSError, ValueError):
+                return None
+            if not ready:
+                return ""
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                return None
+            if not chunk:
+                if carry:
+                    out, carry = carry, ""
+                    return out
+                return None
+            carry += chunk.decode("utf-8", errors="replace")
+            if "\n" in carry:
+                line, _, carry = carry.partition("\n")
+                return line + "\n"
+            # Flush long chunks without newline so progress still hits the log.
+            if len(carry) >= 512:
+                out, carry = carry, ""
+                return out
+            return ""
 
         return read_until_markers(read_line, out_path, timeout, verbose)
     finally:
         if proc and proc.poll() is None:
             try:
-                if proc.stdin:
-                    proc.stdin.write("\r~.\r")
-                    proc.stdin.flush()
-            except Exception:
+                if master_fd is not None:
+                    os.write(master_fd, b"\r~.\r")
+            except OSError:
                 pass
             time.sleep(0.3)
             proc.send_signal(signal.SIGTERM)
@@ -302,6 +352,16 @@ def capture_from_popen(
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        if slave_fd is not None:
+            try:
+                os.close(slave_fd)
+            except OSError:
+                pass
+        if master_fd is not None:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
 
 
 def which(cmd: str) -> str | None:
