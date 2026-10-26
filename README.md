@@ -14,9 +14,33 @@ The ISO is a **live** image (`rd.live.image` / squashfs). It boots and runs in R
 
 - Active RHEL subscription / access to `registry.redhat.io`
 - Podman (or compatible build tool)
-- Logged in: `podman login registry.redhat.io`
+- Logged in as the same user that runs the build: the playbook uses `sudo podman`, so use **`sudo podman login registry.redhat.io`**
 
 LLDP only works if the attached switch has LLDP (or compatible CDP receive) enabled on the port.
+
+### AWS RHEL AMI (EC2) build host
+
+Marketplace RHUI AMIs can install host packages via RHUI, but this build bind-mounts host entitlements + `/etc/yum.repos.d` and needs **subscription CDN** repos (`redhat.repo`). You still do registry login + register once; the playbook then enables CDN for the build.
+
+```bash
+# Playbook uses `sudo podman` → root's auth store
+sudo podman login registry.redhat.io
+
+# AMI RHUI billing ≠ Customer Portal subscription — register once
+sudo subscription-manager register \
+  --org='YOUR_ORG_ID' \
+  --activationkey='YOUR_ACTIVATION_KEY'
+# or: sudo subscription-manager register --username='YOUR_RH_USER' --auto-attach
+```
+
+On `tags: build`, the playbook then:
+
+1. Checks `subscription-manager identity` (fails with a clear message if unregistered)
+2. Disables `*rhui*` repos (best-effort)
+3. Sets `manage_repos=1`, refreshes, enables `rhel-9-for-x86_64-baseos-rpms` + `appstream`
+4. Fails if neither `redhat.repo` nor `rhel9-cdn-manual.repo` exists
+
+**Fallback** if the playbook still fails with missing CDN repos: write `/etc/yum.repos.d/rhel9-cdn-manual.repo` pointing at `cdn.redhat.com` with your `/etc/pki/entitlement/*.pem` client cert/key (`sslverify=0`). The Containerfile prefers that file when present. Some Marketplace images resist re-register — use a Cloud Access AMI or build on a separately subscribed host.
 
 ## Ansible: build live ISO → Redfish virtual media → SOL scrape
 
@@ -84,7 +108,7 @@ ansible-playbook -i inventory.yml playbook.yml \
   -e redfish_username=admin
 ```
 
-`redfish_address` can be a host, `host:port`, or a full `https://…/redfish/v1/Systems/<id>` URL. The playbook sends `host:port` to the Redfish modules and uses the UUID as the system id. Serial capture uses IPMI SOL on the BMC host (port 623) by default; set `sol_transport=redfish` or `auto` for Redfish SSH/websocket instead.
+`redfish_address` can be a host, `host:port`, or a full `https://…/redfish/v1/Systems/<id>` URL. The playbook sends `host:port` to the Redfish modules and uses the UUID as the system id. Serial capture defaults to `sol_transport=auto` (IPMI SOL, then Redfish SSH/websocket).
 
 Skip rebuild on later runs:
 
@@ -122,9 +146,9 @@ Tags: `build`, `deploy`, `capture`.
 | `iso_http_host` | Address the **BMC** uses to fetch the ISO (not `127.0.0.1`) |
 | `iso_http_port` | Default `8080` — open in firewall toward the BMC |
 | `sol_timeout_seconds` | Default `900` (live boot + LLDP wait) |
-| `sol_transport` | `ipmi` (default), `redfish`, or `auto` |
+| `sol_transport` | `auto` (default: IPMI then Redfish), `ipmi`, or `redfish` |
 
-SOL uses **IPMI-over-LAN** (`ipmitool sol activate`) against the same BMC address/creds by default. Enable IPMI/SOL on the BMC if it is disabled (Redfish working does **not** imply IPMI is on).
+Serial scrape tries **IPMI SOL** first, then **Redfish** serial (SSH / OpenBMC websocket) when `sol_transport=auto`. IPMI working for power/sensors does **not** imply SOL payload is available.
 
 If capture fails with `Unable to establish IPMI v2 / RMCP+ session`:
 
@@ -143,7 +167,7 @@ ipmitool -I lanplus -H <bmc> -U admin -P "$REDFISH_PASSWORD" sol set enabled tru
 ipmitool -I lanplus -H <bmc> -U admin -P "$REDFISH_PASSWORD" sol payload enable 1 <userid>
 ```
 
-Optional: `sol_transport=redfish` discovers Redfish `SerialConsole` (SSH / OpenBMC `/console0`); `auto` tries IPMI then Redfish.
+If `sol payload enable` returns `Invalid command` (common on VirtualBMC / some emulators), IPMI SOL cannot be enabled. With the default `sol_transport=auto`, capture stops the IPMI attempt and falls through to Redfish serial (SSH / OpenBMC `/console0`). Force that path with `sol_transport=redfish`.
 
 ## Manual build (live ISO)
 

@@ -83,27 +83,57 @@ CONF
 
 # EFI layout expected by the container-native ISO contract.
 # In bootc images /boot/efi is often empty even when shim-x64/grub2-efi-x64 are
-# installed. Download the RPMs and extract their EFI payloads with rpm2cpio.
+# installed. Stage from package-owned paths first; only then re-download RPMs
+# (same CDN pin as the install step — plain `dnf download` can fail on RHUI AMIs).
 mkdir -p /boot/efi/EFI/BOOT /boot/efi/EFI/redhat
 for efi_dir in /usr/lib/efi/*/*/EFI /usr/lib/efi/*/EFI; do
   [ -d "${efi_dir}" ] || continue
   cp -ra "${efi_dir}/." /boot/efi/EFI/ 2>/dev/null || true
 done
-efi_extract="$(mktemp -d)"
-(
-  set -euo pipefail
-  cd "${efi_extract}"
-  dnf -y --setopt=sslverify=0 --setopt=sslverifystatus=0 download \
-    --destdir="${efi_extract}" shim-x64 grub2-efi-x64
-  for rpm in shim-x64*.rpm grub2-efi-x64-*.rpm; do
-    [[ -f "${rpm}" ]] || continue
-    [[ "${rpm}" == *cdboot* ]] && continue
-    rpm2cpio "${rpm}" | cpio -idmu --quiet
-  done
-  test -d boot/efi/EFI
-  cp -a boot/efi/EFI/. /boot/efi/EFI/
-)
-rm -rf "${efi_extract}"
+# Copy any .efi files the installed RPMs already own (no network).
+while IFS= read -r efi_path; do
+  [[ -f "${efi_path}" ]] || continue
+  case "${efi_path}" in
+    */EFI/BOOT/*|*/EFI/redhat/*|*/EFI/centos/*|*/EFI/fedora/*)
+      rel="${efi_path#*/EFI/}"
+      mkdir -p "/boot/efi/EFI/$(dirname "${rel}")"
+      cp -a "${efi_path}" "/boot/efi/EFI/${rel}"
+      ;;
+  esac
+done < <(rpm -ql shim-x64 grub2-efi-x64 2>/dev/null | grep -E '\.efi$' || true)
+
+if [[ ! -f /boot/efi/EFI/BOOT/BOOTX64.EFI ]]; then
+  if [[ -f /etc/yum.repos.d/rhel9-cdn-manual.repo ]]; then
+    mapfile -t DNF_CDN < <(printf '%s\n' \
+      --setopt=sslverify=0 \
+      --setopt=sslverifystatus=0 \
+      --disablerepo='*' \
+      --enablerepo=rhel9-baseos-manual \
+      --enablerepo=rhel9-appstream-manual)
+  else
+    mapfile -t DNF_CDN < <(printf '%s\n' \
+      --setopt=sslverify=0 \
+      --setopt=sslverifystatus=0 \
+      --disablerepo='*' \
+      --enablerepo=rhel-9-for-x86_64-baseos-rpms \
+      --enablerepo=rhel-9-for-x86_64-appstream-rpms)
+  fi
+  efi_extract="$(mktemp -d)"
+  (
+    set -euo pipefail
+    cd "${efi_extract}"
+    dnf -y "${DNF_CDN[@]}" download \
+      --destdir="${efi_extract}" shim-x64 grub2-efi-x64
+    for rpm in shim-x64*.rpm grub2-efi-x64-*.rpm; do
+      [[ -f "${rpm}" ]] || continue
+      [[ "${rpm}" == *cdboot* ]] && continue
+      rpm2cpio "${rpm}" | cpio -idmu --quiet
+    done
+    test -d boot/efi/EFI
+    cp -a boot/efi/EFI/. /boot/efi/EFI/
+  )
+  rm -rf "${efi_extract}"
+fi
 # Normalize removable-media + vendor paths.
 if [[ -f /boot/efi/EFI/redhat/shimx64.efi && ! -f /boot/efi/EFI/BOOT/BOOTX64.EFI ]]; then
   cp -a /boot/efi/EFI/redhat/shimx64.efi /boot/efi/EFI/BOOT/BOOTX64.EFI
@@ -115,9 +145,10 @@ if [[ -f /boot/efi/EFI/redhat/grubx64.efi ]]; then
   cp -a /boot/efi/EFI/redhat/grubx64.efi /boot/efi/EFI/BOOT/grubx64.efi
 fi
 if [[ ! -f /boot/efi/EFI/BOOT/BOOTX64.EFI ]]; then
-  echo "ERROR: no BOOTX64.EFI after rpm2cpio EFI staging. Diagnostics:" >&2
+  echo "ERROR: no BOOTX64.EFI after EFI staging. Diagnostics:" >&2
   rpm -q shim-x64 grub2-efi-x64 || true
-  find /boot/efi -iname '*.efi' 2>/dev/null | head -n 40 >&2 || true
+  rpm -ql shim-x64 grub2-efi-x64 2>/dev/null | grep -E '\.efi$' >&2 || true
+  find /boot/efi /usr/lib/efi -iname '*.efi' 2>/dev/null | head -n 40 >&2 || true
   exit 1
 fi
 

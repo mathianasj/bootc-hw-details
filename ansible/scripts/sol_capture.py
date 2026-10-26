@@ -2,10 +2,10 @@
 """Capture BMC host serial console until hw-gather markers appear.
 
 Transports:
-  ipmi     – IPMI SOL via ipmitool (lanplus). Default.
+  auto     – try ipmi, then redfish. Default.
+  ipmi     – IPMI SOL via ipmitool (lanplus)
   redfish  – discover SerialConsole via Redfish, then attach over SSH
              (and try OpenBMC /console0 websocket)
-  auto     – try ipmi, then redfish
 """
 
 from __future__ import annotations
@@ -585,12 +585,16 @@ def lookup_ipmi_user_id(args: argparse.Namespace) -> int | None:
     return None
 
 
-def enable_sol_payload(args: argparse.Namespace) -> None:
+def enable_sol_payload(args: argparse.Namespace) -> bool:
     """Best-effort enable global SOL and per-user SOL payload.
+
+    Returns True if payload enable appears supported (or succeeded). Returns
+    False when the BMC rejects payload enable with "Invalid command".
 
     "Info: SOL payload disabled" usually means the user lacks SOL payload on
     the LAN channel — fix with `sol payload enable <channel> <userid>` and
-    often `sol set enabled true`.
+    often `sol set enabled true`. Some BMCs return "Invalid command" for
+    payload enable; stop early in that case.
     """
     sys.stderr.write("Enabling IPMI SOL (set enabled + payload) …\n")
     for extra in (
@@ -619,15 +623,32 @@ def enable_sol_payload(args: argparse.Namespace) -> None:
                 sys.stderr.write(
                     f"  sol payload enable {channel} {uid}: ok\n"
                 )
-            elif out and args.verbose:
+                return True
+            if "Invalid command" in out:
+                sys.stderr.write(
+                    "  sol payload enable not supported on this BMC "
+                    "(Invalid command) — will rely on Redfish if transport=auto\n"
+                )
+                return False
+            if out and args.verbose:
                 sys.stderr.write(
                     f"  sol payload enable {channel} {uid}: {out}\n"
                 )
+    return True
 
 
 def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
     require_ipmitool(args.ipmitool)
-    enable_sol_payload(args)
+    payload_ok = enable_sol_payload(args)
+    if not payload_ok:
+        # BMC rejected sol payload enable (e.g. VirtualBMC "Invalid command").
+        # Do not activate/retry — let transport=auto fall through to Redfish.
+        sys.stderr.write(
+            "ERROR: IPMI SOL unavailable (payload enable not supported). "
+            "Falling through if transport=auto; else use sol_transport=redfish.\n"
+        )
+        return "", 4
+
     deactivate_sol(args)
     time.sleep(1)
     cmd = ipmitool_base(args) + ["sol", "activate"]
@@ -638,14 +659,20 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
     )
     deactivate_sol(args)
 
-    if "SOL payload disabled" in buf or "SOL payload disabled" in (
-        Path(out_path).read_text(encoding="utf-8", errors="replace")
-        if out_path.is_file()
-        else ""
-    ):
-        # Retry once after a second enable pass (some BMCs need activate attempt first).
+    sol_disabled = "SOL payload disabled" in buf or (
+        out_path.is_file()
+        and "SOL payload disabled"
+        in out_path.read_text(encoding="utf-8", errors="replace")
+    )
+    if sol_disabled:
+        # Retry once after a second enable pass (some BMCs need activate first).
         sys.stderr.write("SOL payload still disabled; retrying enable + activate …\n")
-        enable_sol_payload(args)
+        if not enable_sol_payload(args):
+            sys.stderr.write(
+                "ERROR: IPMI SOL unavailable (payload enable not supported). "
+                "Falling through if transport=auto; else use sol_transport=redfish.\n"
+            )
+            return buf, 4
         deactivate_sol(args)
         time.sleep(1)
         buf, code = capture_from_popen(
@@ -661,8 +688,7 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
     ):
         sys.stderr.write(
             "ERROR: IPMI SOL unavailable (session/payload). "
-            "Try: ipmitool … sol payload enable 1 <userid> "
-            "or sol_transport=redfish|auto\n"
+            "Use sol_transport=auto|redfish on BMCs that reject payload enable.\n"
         )
         return buf, 4
     return buf, code
@@ -827,8 +853,8 @@ def main() -> int:
     parser.add_argument(
         "--transport",
         choices=("redfish", "ipmi", "auto"),
-        default="ipmi",
-        help="Serial capture transport (default: ipmi)",
+        default="auto",
+        help="Serial capture transport (default: auto = ipmi then redfish)",
     )
     parser.add_argument(
         "--redfish-baseuri",

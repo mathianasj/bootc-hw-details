@@ -55,9 +55,10 @@
     ipmi_username: "{{ redfish_username }}"
     ipmi_password: "{{ redfish_password }}"
     ipmi_port: 623
-    # Serial scrape transport: ipmi (ipmitool SOL; default), redfish
-    # (SSH/websocket via Redfish discovery), or auto (ipmi then redfish).
-    sol_transport: ipmi
+    # Serial scrape transport: auto (ipmi then redfish; default), ipmi, or
+    # redfish (SSH/websocket). Many BMCs expose IPMI but leave SOL payload
+    # disabled / unsupported — auto falls through to Redfish serial.
+    sol_transport: auto
 
     iso_http_bind: "0.0.0.0"
     iso_http_port: 8080
@@ -138,15 +139,102 @@
 
   tasks:
     # ------------------------------------------------------------------ build
-    - name: Ensure CDN BaseOS/AppStream repos are available on the build host
+    # RHUI AMIs often ship manage_repos=0 (no redhat.repo). After the operator
+    # runs `subscription-manager register`, prepare CDN repos for the bind-mounted
+    # Containerfile build. Skip when a manual CDN repo is already present.
+    - name: Check for manual CDN repo override
+      ansible.builtin.stat:
+        path: /etc/yum.repos.d/rhel9-cdn-manual.repo
+      register: cdn_manual_repo
+      when: not skip_build | bool
+      tags: [build]
+
+    - name: Require subscription-manager registration on the build host
+      ansible.builtin.command:
+        cmd: sudo subscription-manager identity
+      register: rhsm_identity
+      changed_when: false
+      failed_when: false
+      when:
+        - not skip_build | bool
+        - not (cdn_manual_repo.stat.exists | default(false))
+      tags: [build]
+
+    - name: Fail when build host is not registered with Red Hat
+      ansible.builtin.fail:
+        msg: >-
+          Build host is not registered (subscription-manager identity failed).
+          Register first (AMI RHUI ≠ CDN): subscription-manager register
+          --org=… --activationkey=… (or --username=… --auto-attach), then
+          re-run. Or place /etc/yum.repos.d/rhel9-cdn-manual.repo — see README
+          "AWS RHEL AMI (EC2) build host".
+      when:
+        - not skip_build | bool
+        - not (cdn_manual_repo.stat.exists | default(false))
+        - rhsm_identity.rc | default(1) != 0
+      tags: [build]
+
+    - name: Disable RHUI repos so CDN is preferred for the image build
+      ansible.builtin.command:
+        cmd: sudo dnf config-manager --disable '*rhui*'
+      when:
+        - not skip_build | bool
+        - not (cdn_manual_repo.stat.exists | default(false))
+      failed_when: false
+      changed_when: true
+      tags: [build]
+
+    - name: Enable RHSM-managed redhat.repo on RHUI AMIs
+      ansible.builtin.command:
+        cmd: sudo subscription-manager config --rhsm.manage_repos=1
+      when:
+        - not skip_build | bool
+        - not (cdn_manual_repo.stat.exists | default(false))
+      changed_when: true
+      tags: [build]
+
+    - name: Refresh subscription-manager data
+      ansible.builtin.command:
+        cmd: sudo subscription-manager refresh
+      when:
+        - not skip_build | bool
+        - not (cdn_manual_repo.stat.exists | default(false))
+      changed_when: true
+      tags: [build]
+
+    - name: Enable CDN BaseOS and AppStream repos
       ansible.builtin.command:
         cmd: >-
           sudo subscription-manager repos
           --enable=rhel-9-for-x86_64-baseos-rpms
           --enable=rhel-9-for-x86_64-appstream-rpms
-      when: not skip_build | bool
-      failed_when: false
+      when:
+        - not skip_build | bool
+        - not (cdn_manual_repo.stat.exists | default(false))
       changed_when: true
+      tags: [build]
+
+    - name: Verify CDN repo file for bind-mounted build
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /etc/yum.repos.d/redhat.repo
+        - /etc/yum.repos.d/rhel9-cdn-manual.repo
+      register: cdn_repo_files
+      when: not skip_build | bool
+      tags: [build]
+
+    - name: Fail when no CDN repo file is available for the container build
+      ansible.builtin.fail:
+        msg: >-
+          Neither /etc/yum.repos.d/redhat.repo nor rhel9-cdn-manual.repo
+          exists. The Containerfile needs one of them (Unknown repo:
+          rhel-9-for-x86_64-baseos-rpms). After register, ensure
+          manage_repos=1 + refresh succeeded, or create the manual CDN
+          repo — see README "AWS RHEL AMI (EC2) build host".
+      when:
+        - not skip_build | bool
+        - (cdn_repo_files.results | selectattr('stat.exists') | list | length) == 0
       tags: [build]
 
     - name: Build bootc container image (live-capable)
@@ -757,7 +845,7 @@
         cmd: sudo dnf install -y ipmitool
       when:
         - ansible_os_family == 'RedHat'
-        - sol_transport | default('ipmi') in ['ipmi', 'auto']
+        - sol_transport | default('auto') in ['ipmi', 'auto']
       tags: [capture]
       changed_when: true
 
@@ -766,7 +854,7 @@
         cmd: sudo dnf install -y openssh-clients sshpass
       when:
         - ansible_os_family == 'RedHat'
-        - sol_transport | default('ipmi') in ['redfish', 'auto']
+        - sol_transport | default('auto') in ['redfish', 'auto']
       tags: [capture]
       changed_when: true
       failed_when: false
@@ -777,7 +865,7 @@
           - python3
           - "{{ sol_capture_script }}"
           - --transport
-          - "{{ sol_transport | default('ipmi') }}"
+          - "{{ sol_transport | default('auto') }}"
           - --host
           - "{{ redfish_bmc_host }}"
           - --username
