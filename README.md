@@ -167,7 +167,7 @@ ipmitool -I lanplus -H <bmc> -U admin -P "$REDFISH_PASSWORD" sol set enabled tru
 ipmitool -I lanplus -H <bmc> -U admin -P "$REDFISH_PASSWORD" sol payload enable 1 <userid>
 ```
 
-If `sol payload enable` returns `Invalid command` (common on VirtualBMC / some emulators), IPMI SOL cannot be enabled. With the default `sol_transport=auto`, capture stops the IPMI attempt and falls through to Redfish serial (SSH / OpenBMC `/console0`). Force that path with `sol_transport=redfish`.
+If `sol payload enable` returns `Invalid command` (common on **VirtualBMC**), capture still tries `sol activate` — VirtualBMC often supports activate without payload enable. Redfish fallback only probes OpenBMC-style SSH `:2200` / `/console0` when the BMC looks like OpenBMC; **sushy-emulator** does not expose those, so use IPMI SOL (VirtualBMC) for that lab.
 
 ## Manual build (live ISO)
 

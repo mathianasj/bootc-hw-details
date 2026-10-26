@@ -49,7 +49,11 @@ else
 fi
 
 CID=""
+SQ_MNT=""
 cleanup() {
+  if [[ -n "$SQ_MNT" ]] && mountpoint -q "$SQ_MNT" 2>/dev/null; then
+    umount "$SQ_MNT" >/dev/null 2>&1 || true
+  fi
   if [[ -n "$CID" ]]; then
     "$PODMAN" umount "$CID" >/dev/null 2>&1 || true
     "$PODMAN" rm "$CID" >/dev/null 2>&1 || true
@@ -248,10 +252,40 @@ for vendor_dir in "$ISO_ROOT"/EFI/*/; do
 done
 
 echo "==> creating squashfs (this takes a while)"
-mksquashfs "$ROOTFS" "$ISO_ROOT/LiveOS/squashfs.img" \
+# dmsquash-live treats squashfs as a direct rootfs only if /proc exists as a
+# *directory* inside the image (see dmsquash-live-root.sh). Excluding bare
+# "proc"/"sys"/"dev" removes those dirs and boot dies with:
+#   Failed to find a root filesystem in .../LiveOS/squashfs.img
+# Use a writable overlay so we can ensure empty dirs even when ROOTFS is RO
+# (podman mount), and exclude contents with -wildcards, not the dirs.
+SQ_UPPER="$WORKDIR/sq-upper"
+SQ_WORK="$WORKDIR/sq-work"
+SQ_MNT="$WORKDIR/sq-mnt"
+rm -rf "$SQ_UPPER" "$SQ_WORK" "$SQ_MNT"
+mkdir -p "$SQ_UPPER" "$SQ_WORK" "$SQ_MNT"
+mount -t overlay overlay \
+  -o "lowerdir=${ROOTFS},upperdir=${SQ_UPPER},workdir=${SQ_WORK}" \
+  "$SQ_MNT"
+mkdir -p "$SQ_MNT"/{proc,sys,dev,run,tmp,var/tmp}
+mksquashfs "$SQ_MNT" "$ISO_ROOT/LiveOS/squashfs.img" \
   -noappend -comp xz -Xbcj x86 -b 1M -processors "$(nproc)" \
-  -e boot/efi proc sys dev run tmp var/tmp \
-  -e root/.cache var/cache var/lib/containers
+  -wildcards \
+  -e 'boot/efi' \
+  -e 'boot/efi/*' \
+  -e 'proc/*' \
+  -e 'sys/*' \
+  -e 'dev/*' \
+  -e 'run/*' \
+  -e 'tmp/*' \
+  -e 'var/tmp/*' \
+  -e 'root/.cache' \
+  -e 'root/.cache/*' \
+  -e 'var/cache' \
+  -e 'var/cache/*' \
+  -e 'var/lib/containers' \
+  -e 'var/lib/containers/*'
+umount "$SQ_MNT"
+SQ_MNT=""
 
 echo "==> building EFI boot image"
 EFI_IMG="$WORKDIR/efiboot.img"

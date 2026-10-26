@@ -3,9 +3,10 @@
 
 Transports:
   auto     – try ipmi, then redfish. Default.
-  ipmi     – IPMI SOL via ipmitool (lanplus)
+  ipmi     – IPMI SOL via ipmitool (lanplus). Still activates when
+             ``sol payload enable`` returns Invalid command (VirtualBMC).
   redfish  – discover SerialConsole via Redfish, then attach over SSH
-             (and try OpenBMC /console0 websocket)
+             (OpenBMC :2200 /console0 only when the BMC looks like OpenBMC)
 """
 
 from __future__ import annotations
@@ -150,10 +151,14 @@ def discover_serial_console(
             if odata and odata not in resources:
                 resources.append(odata)
 
+    openbmc_hint = False
     for path in resources:
         data = redfish_get_json(base, path, username, password, validate_certs)
         if not isinstance(data, dict):
             continue
+        blob = json.dumps(data).lower()
+        if "openbmc" in blob or "bmcweb" in blob:
+            openbmc_hint = True
         serial = data.get("SerialConsole") or data.get("HostSerialConsole")
         if not isinstance(serial, dict):
             continue
@@ -163,10 +168,13 @@ def discover_serial_console(
                 continue
             if conf.get("ServiceEnabled") is False:
                 continue
+            port = int(conf.get("Port") or (22 if kind == "SSH" else 0))
+            if port == 2200:
+                openbmc_hint = True
             candidates.append(
                 {
                     "kind": kind.lower(),
-                    "port": int(conf.get("Port") or (22 if kind == "SSH" else 0)),
+                    "port": port,
                     "shared": bool(conf.get("SharedWithManagerCLI", False)),
                     "entry": conf.get("ConsoleEntryCommand") or "",
                     "source": path,
@@ -174,7 +182,9 @@ def discover_serial_console(
             )
 
     # Prefer vendor-advertised consoles that look like real host serial,
-    # then OpenBMC defaults, then plain SSH:22 (often just the BMC shell).
+    # then plain SSH:22 (often just the BMC shell). Only add OpenBMC
+    # defaults when the BMC looks like OpenBMC — sushy-emulator / iDRAC /
+    # VirtualBMC labs do not expose :2200 or /console0.
     ranked: list[dict[str, Any]] = []
     fallbacks: list[dict[str, Any]] = []
     for cand in candidates:
@@ -186,24 +196,25 @@ def discover_serial_console(
             fallbacks.append(cand)
 
     host = urlparse(base).hostname or ""
-    ranked.append(
-        {
-            "kind": "ssh",
-            "port": 2200,
-            "shared": False,
-            "entry": "",
-            "source": "openbmc-default-2200",
-            "host": host,
-        }
-    )
-    ranked.append(
-        {
-            "kind": "websocket",
-            "path": "/console0",
-            "source": "openbmc-websocket",
-            "host": host,
-        }
-    )
+    if openbmc_hint:
+        ranked.append(
+            {
+                "kind": "ssh",
+                "port": 2200,
+                "shared": False,
+                "entry": "",
+                "source": "openbmc-default-2200",
+                "host": host,
+            }
+        )
+        ranked.append(
+            {
+                "kind": "websocket",
+                "path": "/console0",
+                "source": "openbmc-websocket",
+                "host": host,
+            }
+        )
     ranked.extend(fallbacks)
     return ranked
 
@@ -585,16 +596,14 @@ def lookup_ipmi_user_id(args: argparse.Namespace) -> int | None:
     return None
 
 
-def enable_sol_payload(args: argparse.Namespace) -> bool:
+def enable_sol_payload(args: argparse.Namespace) -> str:
     """Best-effort enable global SOL and per-user SOL payload.
 
-    Returns True if payload enable appears supported (or succeeded). Returns
-    False when the BMC rejects payload enable with "Invalid command".
-
-    "Info: SOL payload disabled" usually means the user lacks SOL payload on
-    the LAN channel — fix with `sol payload enable <channel> <userid>` and
-    often `sol set enabled true`. Some BMCs return "Invalid command" for
-    payload enable; stop early in that case.
+    Returns:
+      "ok"           – payload enable succeeded (or no Invalid command seen)
+      "unsupported"  – BMC rejected payload enable with "Invalid command"
+                       (VirtualBMC and some emulators). Caller should still
+                       try ``sol activate``; that often works without enable.
     """
     sys.stderr.write("Enabling IPMI SOL (set enabled + payload) …\n")
     for extra in (
@@ -623,32 +632,24 @@ def enable_sol_payload(args: argparse.Namespace) -> bool:
                 sys.stderr.write(
                     f"  sol payload enable {channel} {uid}: ok\n"
                 )
-                return True
+                return "ok"
             if "Invalid command" in out:
                 sys.stderr.write(
                     "  sol payload enable not supported on this BMC "
-                    "(Invalid command) — will rely on Redfish if transport=auto\n"
+                    "(Invalid command) — continuing with sol activate "
+                    "(VirtualBMC / emulators often still work)\n"
                 )
-                return False
+                return "unsupported"
             if out and args.verbose:
                 sys.stderr.write(
                     f"  sol payload enable {channel} {uid}: {out}\n"
                 )
-    return True
+    return "ok"
 
 
 def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
     require_ipmitool(args.ipmitool)
-    payload_ok = enable_sol_payload(args)
-    if not payload_ok:
-        # BMC rejected sol payload enable (e.g. VirtualBMC "Invalid command").
-        # Do not activate/retry — let transport=auto fall through to Redfish.
-        sys.stderr.write(
-            "ERROR: IPMI SOL unavailable (payload enable not supported). "
-            "Falling through if transport=auto; else use sol_transport=redfish.\n"
-        )
-        return "", 4
-
+    payload_status = enable_sol_payload(args)
     deactivate_sol(args)
     time.sleep(1)
     cmd = ipmitool_base(args) + ["sol", "activate"]
@@ -664,15 +665,11 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
         and "SOL payload disabled"
         in out_path.read_text(encoding="utf-8", errors="replace")
     )
-    if sol_disabled:
-        # Retry once after a second enable pass (some BMCs need activate first).
+    # Retry enable+activate only when payload enable is supported; VirtualBMC
+    # returns Invalid command and activate either works or it doesn't.
+    if sol_disabled and payload_status == "ok":
         sys.stderr.write("SOL payload still disabled; retrying enable + activate …\n")
-        if not enable_sol_payload(args):
-            sys.stderr.write(
-                "ERROR: IPMI SOL unavailable (payload enable not supported). "
-                "Falling through if transport=auto; else use sol_transport=redfish.\n"
-            )
-            return buf, 4
+        enable_sol_payload(args)
         deactivate_sol(args)
         time.sleep(1)
         buf, code = capture_from_popen(
@@ -688,7 +685,7 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
     ):
         sys.stderr.write(
             "ERROR: IPMI SOL unavailable (session/payload). "
-            "Use sol_transport=auto|redfish on BMCs that reject payload enable.\n"
+            "Falling through if transport=auto.\n"
         )
         return buf, 4
     return buf, code

@@ -1,5 +1,7 @@
 # Live ISO contract (no Anaconda / no disk install).
 # CDLABEL must match `label` exactly for root=live:CDLABEL=...
+# rd.live.overlay.overlayfs=1: squashfs is used as the root directly (requires
+# /proc inside LiveOS/squashfs.img — see scripts/build-live-iso.sh).
 label: HWGATHER
 grub2:
   default: 0
