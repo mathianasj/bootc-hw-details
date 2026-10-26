@@ -550,13 +550,26 @@
     - name: Set ISO URL for BMC
       ansible.builtin.set_fact:
         iso_image_url: "http://{{ iso_http_host }}:{{ iso_http_port }}/{{ iso_filename }}"
+        # community.general baseuri is host[:port]; uri tasks need a scheme.
+        redfish_url_root: "https://{{ redfish_baseuri }}"
+      tags: [deploy]
+
+    # sushy-emulator uses the same UUID for System and Manager; if the user only
+    # passed redfish_vm_resource_id, reuse it as the Systems Id for VM ops.
+    - name: Default redfish_system_id from virtual-media resource_id when unset
+      ansible.builtin.set_fact:
+        redfish_system_id: "{{ redfish_vm_resource_id }}"
+      when:
+        - (redfish_system_id | default('') | length) == 0
+        - (redfish_vm_resource_id | default('') | length) > 0
       tags: [deploy]
 
     - name: Show ISO URL the BMC will fetch
       ansible.builtin.debug:
         msg: >-
           Serving {{ iso_dir }}/{{ iso_filename }} as {{ iso_image_url }}
-          (BMC must be able to reach this host:port)
+          (sushy-emulator downloads this on the hypervisor — prefer
+          -e iso_http_host=127.0.0.1 when the emulator is local)
       tags: [deploy]
 
     # ----------------------------------------------------------- HTTP server
@@ -681,35 +694,120 @@
         msg: "Virtual media Manager resource_id={{ redfish_vm_resource_id }}"
       tags: [deploy]
 
-    - name: Eject existing virtual media (ignore errors)
-      community.general.redfish_command:
-        category: "{{ redfish_vm_category }}"
-        command: VirtualMediaEject
-        baseuri: "{{ redfish_auth.baseuri }}"
-        username: "{{ redfish_auth.username }}"
-        password: "{{ redfish_auth.password }}"
+    # community.general VirtualMediaInsert only uses a slot when Inserted=false
+    # AND ImageName is empty. sushy-emulator often leaves ImageName set after
+    # eject, which yields: "Unable to find an available VirtualMedia resource
+    # supporting ['CD', 'DVD']". Drive Insert/Eject via the Cd action URIs
+    # directly (Manager then Systems) — that matches sushy-tools docs.
+    - name: Build VirtualMedia Cd action candidates
+      ansible.builtin.set_fact:
+        vm_cd_paths: >-
+          {{
+            [
+              '/redfish/v1/Managers/' ~ redfish_vm_resource_id ~ '/VirtualMedia/Cd',
+              '/redfish/v1/Systems/' ~ (redfish_system_id | default(redfish_vm_resource_id, true)) ~ '/VirtualMedia/Cd'
+            ] | unique
+          }}
+      tags: [deploy]
+
+    - name: Eject VirtualMedia Cd via Redfish action
+      ansible.builtin.uri:
+        url: "{{ redfish_url_root }}{{ item }}/Actions/VirtualMedia.EjectMedia"
+        method: POST
+        url_username: "{{ redfish_auth.username }}"
+        url_password: "{{ redfish_auth.password }}"
+        force_basic_auth: true
         validate_certs: "{{ redfish_validate_certs }}"
-        resource_id: "{{ redfish_vm_resource_id | default(omit, true) }}"
+        status_code: [200, 202, 204, 400, 404]
+        headers:
+          Content-Type: application/json
+        body_format: json
+        body: {}
+      loop: "{{ vm_cd_paths }}"
+      register: vm_eject_uri
       failed_when: false
       tags: [deploy]
 
-    - name: Insert live ISO via Redfish virtual media
-      community.general.redfish_command:
-        category: "{{ redfish_vm_category }}"
-        command: VirtualMediaInsert
-        baseuri: "{{ redfish_auth.baseuri }}"
-        username: "{{ redfish_auth.username }}"
-        password: "{{ redfish_auth.password }}"
+    - name: Insert VirtualMedia Cd via Redfish action
+      ansible.builtin.uri:
+        url: "{{ redfish_url_root }}{{ item }}/Actions/VirtualMedia.InsertMedia"
+        method: POST
+        url_username: "{{ redfish_auth.username }}"
+        url_password: "{{ redfish_auth.password }}"
+        force_basic_auth: true
         validate_certs: "{{ redfish_validate_certs }}"
-        resource_id: "{{ redfish_vm_resource_id | default(omit, true) }}"
-        virtual_media:
-          image_url: "{{ iso_image_url }}"
-          media_types:
-            - CD
-            - DVD
-          inserted: true
-          write_protected: true
-      register: vm_insert
+        status_code: [200, 202, 204]
+        headers:
+          Content-Type: application/json
+        body_format: json
+        body:
+          Image: "{{ iso_image_url }}"
+          Inserted: true
+      loop: "{{ vm_cd_paths }}"
+      register: vm_insert_uri
+      failed_when: false
+      tags: [deploy]
+
+    - name: Read VirtualMedia Cd state after insert
+      ansible.builtin.uri:
+        url: "{{ redfish_url_root }}{{ item }}"
+        method: GET
+        url_username: "{{ redfish_auth.username }}"
+        url_password: "{{ redfish_auth.password }}"
+        force_basic_auth: true
+        validate_certs: "{{ redfish_validate_certs }}"
+        status_code: [200, 404]
+      loop: "{{ vm_cd_paths }}"
+      register: vm_cd_state
+      failed_when: false
+      tags: [deploy]
+
+    - name: Decide whether VirtualMedia Cd shows our ISO
+      ansible.builtin.set_fact:
+        vm_iso_inserted: >-
+          {{
+            vm_cd_state.results
+            | default([])
+            | selectattr('status', 'defined')
+            | selectattr('status', 'equalto', 200)
+            | selectattr('json', 'defined')
+            | map(attribute='json')
+            | selectattr('Inserted', 'defined')
+            | selectattr('Inserted')
+            | selectattr('Image', 'defined')
+            | map(attribute='Image')
+            | select('search', iso_filename)
+            | list
+            | length > 0
+          }}
+        vm_cd_debug: >-
+          {{
+            vm_cd_state.results
+            | default([])
+            | selectattr('json', 'defined')
+            | map(attribute='json')
+            | list
+          }}
+      tags: [deploy]
+
+    - name: Show VirtualMedia Cd state
+      ansible.builtin.debug:
+        msg:
+          - "iso_image_url={{ iso_image_url }}"
+          - "vm_iso_inserted={{ vm_iso_inserted }}"
+          - "cd={{ vm_cd_debug | to_nice_json }}"
+          - "insert_statuses={{ vm_insert_uri.results | default([]) | map(attribute='status') | list }}"
+      tags: [deploy]
+
+    - name: Fail when VirtualMedia Cd does not show the live ISO inserted
+      ansible.builtin.fail:
+        msg: >-
+          Could not insert {{ iso_filename }} via Redfish VirtualMedia.Cd.
+          URL was {{ iso_image_url }}. For sushy-emulator on this hypervisor,
+          re-run with -e iso_http_host=127.0.0.1 and confirm
+          curl -I {{ iso_image_url }} works. Check sushy-emulator logs if
+          InsertMedia returns 4xx. Cd state: {{ vm_cd_debug }}.
+      when: not (vm_iso_inserted | bool)
       tags: [deploy]
 
     - name: Set one-time boot to CD (virtual media)

@@ -54,6 +54,11 @@ cleanup() {
   if [[ -n "$SQ_MNT" ]] && mountpoint -q "$SQ_MNT" 2>/dev/null; then
     umount "$SQ_MNT" >/dev/null 2>&1 || true
   fi
+  # Overlay upper/work are root-owned; always remove so later ansible.builtin.find
+  # is not blocked by Permission denied on sq-work/work.
+  if [[ -n "${WORKDIR:-}" ]]; then
+    rm -rf "${WORKDIR}/sq-upper" "${WORKDIR}/sq-work" "${WORKDIR}/sq-mnt" "${WORKDIR}/sq-check" 2>/dev/null || true
+  fi
   if [[ -n "$CID" ]]; then
     "$PODMAN" umount "$CID" >/dev/null 2>&1 || true
     "$PODMAN" rm "$CID" >/dev/null 2>&1 || true

@@ -26,16 +26,20 @@ all:
     podman_cmd: "sudo podman"
     skip_build: false
 
-    # HTTP serve so the BMC can pull the ISO (must be reachable from BMC)
+    # HTTP serve for VirtualMediaInsert. The *emulator/BMC process* must be
+    # able to download this URL (sushy-emulator fetches it on the hypervisor).
     # iso_http_bind: "0.0.0.0"
     # iso_http_port: 8080
+    # Same host as sushy-emulator — prefer loopback so the download always works:
+    # iso_http_host: "127.0.0.1"
+    # Remote BMC: use an address the BMC can route to:
     # iso_http_host: "{{ ansible_default_ipv4.address }}"
 
     # Redfish virtual media (vendor-dependent)
-    redfish_vm_category: "Manager"   # or Systems
+    redfish_vm_category: "Manager"   # or Systems (playbook retries Systems if needed)
     # Required when the BMC has more than one Manager (playbook auto-picks
     # BMC/iDRAC/1 when possible; otherwise set explicitly):
-    # redfish_vm_resource_id: "BMC"  # e.g. BMC, 1, iDRAC.Embedded.1
+    # redfish_vm_resource_id: "BMC"  # e.g. BMC, 1, iDRAC.Embedded.1, or Systems UUID
     # redfish_system_id: "1"
 
     # Timing (live boot — no Anaconda)
