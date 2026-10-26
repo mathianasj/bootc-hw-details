@@ -263,12 +263,18 @@ def capture_from_popen(
     verbose: bool,
     env: dict[str, str] | None = None,
     stdin_text: str | None = None,
+    keepalive: bytes | None = None,
+    keepalive_interval: float = 0.5,
 ) -> tuple[str, int]:
     """Run cmd and scrape stdout until markers.
 
     Uses a PTY so ipmitool SOL can tcsetattr (avoids ``Inappropriate ioctl``
     and some BMCs dropping data on a plain pipe). Reads with ``select`` so an
     idle SOL session cannot block past ``timeout`` on ``readline()``.
+
+    ``keepalive`` (e.g. ``b"\\r"``) is written on idle polls. VirtualBMC SOL
+    often delivers no guest→host serial until the client sends keystrokes —
+    holding Enter in an interactive session shows the same behavior.
     """
     import pty
     import select
@@ -294,9 +300,10 @@ def capture_from_popen(
 
         # Partial line carry; select-based reader returns "" when idle.
         carry = ""
+        last_keepalive = time.monotonic()
 
         def read_line() -> str | None:
-            nonlocal carry
+            nonlocal carry, last_keepalive
             assert proc is not None and master_fd is not None
             if proc.poll() is not None:
                 # Drain remaining PTY data after exit.
@@ -318,6 +325,15 @@ def capture_from_popen(
             except (OSError, ValueError):
                 return None
             if not ready:
+                if (
+                    keepalive
+                    and (time.monotonic() - last_keepalive) >= keepalive_interval
+                ):
+                    try:
+                        os.write(master_fd, keepalive)
+                    except OSError:
+                        pass
+                    last_keepalive = time.monotonic()
                 return ""
             try:
                 chunk = os.read(master_fd, 4096)
@@ -715,8 +731,20 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
     cmd = ipmitool_base(args) + ["sol", "activate"]
     env = os.environ.copy()
     env["IPMITOOL_PASSWORD"] = args.password or ""
+    # VirtualBMC: guest serial RX often stalls until the client transmits
+    # (same as holding Enter in an interactive sol activate session).
+    sys.stderr.write(
+        "IPMI SOL keepalive: sending CR every 0.5s so VirtualBMC keeps "
+        "streaming guest output\n"
+    )
     buf, code = capture_from_popen(
-        cmd, out_path, args.timeout, args.verbose, env=env
+        cmd,
+        out_path,
+        args.timeout,
+        args.verbose,
+        env=env,
+        keepalive=b"\r",
+        keepalive_interval=0.5,
     )
     deactivate_sol(args)
 
@@ -733,7 +761,13 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
         deactivate_sol(args)
         time.sleep(1)
         buf, code = capture_from_popen(
-            cmd, out_path, args.timeout, args.verbose, env=env
+            cmd,
+            out_path,
+            args.timeout,
+            args.verbose,
+            env=env,
+            keepalive=b"\r",
+            keepalive_interval=0.5,
         )
         deactivate_sol(args)
 
