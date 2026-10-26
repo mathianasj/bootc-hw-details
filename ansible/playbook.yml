@@ -68,8 +68,8 @@
     # Live ISO build needs rootful podman + host container storage
     podman_cmd: "sudo podman"
 
-    # Live boot + LLDP wait — no Anaconda install time
-    sol_timeout_seconds: 900
+    # Live boot + LLDP wait — keep short so a dead SOL fails fast
+    sol_timeout_seconds: 180
     post_reboot_settle_seconds: 45
     sol_capture_script: "{{ playbook_dir }}/scripts/sol_capture.py"
 
@@ -922,15 +922,37 @@
         jid: "{{ sol_async.ansible_job_id }}"
       register: sol_capture
       until: sol_capture.finished
-      retries: "{{ ((sol_timeout_seconds | int) / 10) | int + 24 }}"
+      retries: "{{ ((sol_timeout_seconds | int) / 10) | int + 6 }}"
       delay: 10
       when: sol_async.ansible_job_id is defined
+      failed_when: false
+      tags: [capture]
+
+    - name: Read tail of SOL raw log
+      ansible.builtin.command:
+        cmd: "tail -n 200 {{ capture_dir }}/sol-raw.log"
+      register: sol_raw_tail
+      changed_when: false
+      failed_when: false
+      tags: [capture]
+
+    - name: Show SOL capture stderr (script progress)
+      ansible.builtin.debug:
+        var: sol_capture.stderr_lines
+      when: sol_capture is defined and (sol_capture.stderr_lines | default([]) | length) > 0
+      tags: [capture]
+
+    - name: Show SOL raw log (last 200 lines)
+      ansible.builtin.debug:
+        var: sol_raw_tail.stdout_lines
       tags: [capture]
 
     - name: Show parsed hw-gather report
       ansible.builtin.debug:
         var: sol_capture.stdout
-      when: sol_capture is defined
+      when:
+        - sol_capture is defined
+        - (sol_capture.rc | default(1) | int) == 0
       tags: [capture]
 
     - name: Confirm report files on control node
@@ -938,6 +960,20 @@
         msg:
           - "Raw SOL log: {{ capture_dir }}/sol-raw.log"
           - "Parsed report: {{ capture_dir }}/hw-gather-report.txt"
+      tags: [capture]
+
+    - name: Fail when SOL capture did not find hw-gather markers
+      ansible.builtin.fail:
+        msg: >-
+          SOL capture failed or timed out after {{ sol_timeout_seconds }}s
+          (rc={{ sol_capture.rc | default('unset') }},
+          finished={{ sol_capture.finished | default(false) }}).
+          Full log: {{ capture_dir }}/sol-raw.log
+      when: >
+        sol_async.ansible_job_id is defined and (
+          not (sol_capture.finished | default(false))
+          or (sol_capture.rc | default(1) | int) != 0
+        )
       tags: [capture]
 
   post_tasks:

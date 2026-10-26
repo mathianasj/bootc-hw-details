@@ -43,7 +43,7 @@ all:
     # redfish_system_id: "1"
 
     # Timing (live boot — no Anaconda)
-    sol_timeout_seconds: 900
+    sol_timeout_seconds: 180
     post_reboot_settle_seconds: 45
     # Serial scrape: auto (default; ipmi then redfish), ipmi, or redfish
     # sol_transport: auto
