@@ -265,6 +265,7 @@ def capture_from_popen(
     stdin_text: str | None = None,
     keepalive: bytes | None = None,
     keepalive_interval: float = 0.5,
+    keepalive_burst: int = 0,
 ) -> tuple[str, int]:
     """Run cmd and scrape stdout until markers.
 
@@ -272,9 +273,10 @@ def capture_from_popen(
     and some BMCs dropping data on a plain pipe). Reads with ``select`` so an
     idle SOL session cannot block past ``timeout`` on ``readline()``.
 
-    ``keepalive`` (e.g. ``b"\\r"``) is written on idle polls. VirtualBMC SOL
-    often delivers no guest→host serial until the client sends keystrokes —
-    holding Enter in an interactive session shows the same behavior.
+    ``keepalive`` (e.g. ``b"\\r"``) is written on idle polls until the first
+    real firmware/GRUB/kernel byte. VirtualBMC often delivers no guest→host
+    serial until the client sends keystrokes. Continuous CR during early
+    kernel printk saturates SOL — disarm after boot output starts.
     """
     import pty
     import select
@@ -298,12 +300,16 @@ def capture_from_popen(
         if stdin_text:
             os.write(master_fd, stdin_text.encode())
 
+        # Wait briefly for "SOL Session operational" before pumping keys.
+        time.sleep(0.5)
+        if keepalive and keepalive_burst > 0:
+            try:
+                os.write(master_fd, keepalive * keepalive_burst)
+            except OSError:
+                pass
+
         # Partial line carry; select-based reader returns "" when idle.
         carry = ""
-        # VirtualBMC often needs a client TX before any guest RX. Pump CR only
-        # until the first real console byte, then stop — continuous CR during
-        # early kernel printk saturates SOL (blank-line storms + truncated /
-        # corrupted lines, stream dies mid-boot before userspace).
         last_rx = time.monotonic()
         keepalive_armed = keepalive is not None
 
@@ -751,10 +757,10 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
     cmd = ipmitool_base(args) + ["sol", "activate"]
     env = os.environ.copy()
     env["IPMITOOL_PASSWORD"] = args.password or ""
-    # VirtualBMC: need a client TX to start RX; stop CR once firmware/GRUB
-    # appears so we don't saturate SOL during kernel boot.
+    # VirtualBMC: burst CR to unlock RX, then occasional CR until firmware
+    # appears; stop afterward so we don't saturate SOL mid-kernel.
     sys.stderr.write(
-        "IPMI SOL keepalive: CR until first firmware/GRUB/kernel byte\n"
+        "IPMI SOL keepalive: CR burst then until first firmware/GRUB/kernel\n"
     )
     buf, code = capture_from_popen(
         cmd,
@@ -763,7 +769,8 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
         args.verbose,
         env=env,
         keepalive=b"\r",
-        keepalive_interval=2.0,
+        keepalive_interval=0.5,
+        keepalive_burst=8,
     )
     deactivate_sol(args)
 
@@ -786,7 +793,8 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
             args.verbose,
             env=env,
             keepalive=b"\r",
-            keepalive_interval=2.0,
+            keepalive_interval=0.5,
+            keepalive_burst=8,
         )
         deactivate_sol(args)
 

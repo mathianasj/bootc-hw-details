@@ -865,7 +865,27 @@
         seconds: 10
       tags: [deploy]
 
-    - name: Start serial capture before PowerOn
+    # VirtualBMC binds SOL to the qemu serial PTY. Activating while the domain
+    # is Off leaves a dead session after PowerOn (sol-raw.log stuck at
+    # "SOL Session operational" with no guest bytes). Power on first, then
+    # attach SOL immediately and scrape through GRUB/kernel.
+    - name: Power on system to boot live ISO
+      community.general.redfish_command:
+        category: Systems
+        command: PowerOn
+        baseuri: "{{ redfish_auth.baseuri }}"
+        username: "{{ redfish_auth.username }}"
+        password: "{{ redfish_auth.password }}"
+        validate_certs: "{{ redfish_validate_certs }}"
+        resource_id: "{{ redfish_system_id | default(omit, true) }}"
+      tags: [deploy]
+
+    - name: Brief pause for qemu serial PTY after PowerOn
+      ansible.builtin.pause:
+        seconds: 2
+      tags: [deploy, capture]
+
+    - name: Start serial capture after PowerOn
       ansible.builtin.command:
         argv:
           - python3
@@ -900,22 +920,6 @@
         IPMI_PASSWORD: "{{ ipmi_password }}"
         REDFISH_PASSWORD: "{{ redfish_password }}"
       tags: [capture]
-
-    - name: Wait for SOL session to activate
-      ansible.builtin.pause:
-        seconds: 5
-      tags: [deploy, capture]
-
-    - name: Power on system to boot live ISO
-      community.general.redfish_command:
-        category: Systems
-        command: PowerOn
-        baseuri: "{{ redfish_auth.baseuri }}"
-        username: "{{ redfish_auth.username }}"
-        password: "{{ redfish_auth.password }}"
-        validate_certs: "{{ redfish_validate_certs }}"
-        resource_id: "{{ redfish_system_id | default(omit, true) }}"
-      tags: [deploy]
 
     - name: Wait for serial capture until hw-gather markers
       ansible.builtin.async_status:
