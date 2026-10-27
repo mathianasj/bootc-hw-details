@@ -28,9 +28,12 @@ section() {
 serial_progress() {
   local msg="$1"
   local target
-  for target in $(serial_targets); do
+  # Prefer console= UARTs only (see emit_targets).
+  for target in $(emit_targets 2>/dev/null || serial_targets); do
     [[ -c "${target}" ]] || continue
-    printf 'hw-gather: %s\n' "${msg}" >"${target}" 2>/dev/null || true
+    # Prefer a short timeout so a stuck UART cannot freeze inventory.
+    timeout 1 bash -c "printf 'hw-gather: %s\n' \"\$1\" >\"\$2\"" _ "${msg}" "${target}" \
+      2>/dev/null || true
   done
 }
 
@@ -121,51 +124,90 @@ stop_serial_gettys() {
   done
 }
 
+# UARTs from console= only — spare ttyS1/ttyAMA0 often have no host reader and
+# a blocking write there hangs the oneshot forever after "emitting scrape block".
+emit_targets() {
+  local -a found=()
+  local token dev
+
+  if [[ -r /proc/cmdline ]]; then
+    for token in $(tr ' ' '\n' </proc/cmdline | grep '^console='); do
+      token="${token#console=}"
+      dev="${token%%,*}"
+      case "${dev}" in
+        ttyS[0-9]*|ttyAMA[0-9]*|ttyUSB[0-9]*|ttyACM[0-9]*|hvc[0-9]*)
+          found+=("/dev/${dev}")
+          ;;
+      esac
+    done
+  fi
+  if ((${#found[@]} == 0)); then
+    found+=("/dev/ttyS0")
+  fi
+  printf '%s\n' "${found[@]}" | awk 'NF && !seen[$0]++'
+}
+
 emit_to_serial() {
   local path="$1"
   local target
   local wrote=0
-  local rc=0
   local size
-  local offset
-  local chunk=512
-  local n
+  local out=""
 
   stop_serial_gettys
-  # Let the port settle after getty release / Conflicts= stop.
-  sleep 2
+  sleep 1
 
   size="$(wc -c <"${path}" | tr -d ' ')"
 
   while IFS= read -r target; do
-    [[ -e "${target}" ]] || continue
     [[ -c "${target}" ]] || continue
-    # Disable IXON/CRTSCTS — a full PTY with flow control hangs ``cat`` forever
-    # (~64KiB), which left SOL captures with BEGIN but no END (rc=2).
-    stty -F "${target}" raw -echo -ixon -ixoff -crtscts 115200 2>/dev/null || true
-    offset=0
-    rc=0
-    while (( offset < size )); do
-      n="${chunk}"
-      if (( offset + n > size )); then
-        n=$((size - offset))
-      fi
-      if ! dd if="${path}" bs=1 skip="${offset}" count="${n}" status=none 2>/dev/null \
-          | timeout 15 dd of="${target}" bs="${n}" count=1 status=none 2>/dev/null; then
-        rc=$?
-        printf 'hw-gather: short write to %s at %s/%s bytes (exit %s)\n' \
-          "${target}" "${offset}" "${size}" "${rc}" >&2
-        break
-      fi
-      offset=$((offset + n))
-      sleep 0.02
-    done
-    if (( offset >= size )); then
+    stty -F "${target}" raw -echo -ixon -ixoff -crtscts clocal cread 115200 2>/dev/null || true
+    # Non-blocking write: kernel tty writes can sit in D-state where timeout(1)
+    # cannot kill them; O_NONBLOCK + wall clock avoids that hang.
+    if out="$(
+      TARGET="${target}" PATH_IN="${path}" python3 - <<'PY' 2>&1
+import errno
+import os
+import time
+
+target = os.environ["TARGET"]
+path = os.environ["PATH_IN"]
+data = open(path, "rb").read()
+fd = os.open(target, os.O_WRONLY | os.O_NONBLOCK | os.O_NOCTTY)
+deadline = time.monotonic() + 90.0
+off = 0
+try:
+    while off < len(data):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"serial write timed out at {off}/{len(data)}")
+        try:
+            n = os.write(fd, data[off : off + 256])
+        except BlockingIOError:
+            time.sleep(0.02)
+            continue
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                time.sleep(0.02)
+                continue
+            raise
+        if n == 0:
+            time.sleep(0.02)
+            continue
+        off += n
+finally:
+    os.close(fd)
+print(f"nb-write {off}/{len(data)} -> {target}")
+raise SystemExit(0 if off == len(data) else 1)
+PY
+    )"; then
       wrote=1
       printf 'hw-gather: wrote scrape block to %s (%s bytes)\n' \
         "${target}" "${size}" >&2
+      printf '%s\n' "${out}" >&2
+    else
+      printf 'hw-gather: write to %s failed: %s\n' "${target}" "${out}" >&2
     fi
-  done < <(serial_targets)
+  done < <(emit_targets)
 
   if [[ "${wrote}" -eq 0 ]]; then
     printf 'hw-gather: ERROR no serial UART accepted the scrape block\n' >&2
@@ -176,10 +218,11 @@ emit_to_serial() {
 
 # Claim the UART immediately so getty cannot hold it during the long LLDP wait.
 stop_serial_gettys
-for _t in $(serial_targets); do
+for _t in $(emit_targets); do
   [[ -c "${_t}" ]] || continue
-  stty -F "${_t}" raw -echo -ixon -ixoff -crtscts 115200 2>/dev/null || true
-  printf '\nhw-gather: collecting inventory (markers follow when done)…\n' >"${_t}" 2>/dev/null || true
+  stty -F "${_t}" raw -echo -ixon -ixoff -crtscts clocal cread 115200 2>/dev/null || true
+  timeout 1 bash -c "printf '\nhw-gather: collecting inventory (markers follow when done)…\n' >\"\$1\"" _ "${_t}" \
+    2>/dev/null || true
 done
 
 : >"${REPORT}"
