@@ -55,10 +55,10 @@
     ipmi_username: "{{ redfish_username }}"
     ipmi_password: "{{ redfish_password }}"
     ipmi_port: 623
-    # Serial scrape transport: auto (ipmi then redfish; default), ipmi, or
-    # redfish (SSH/websocket). Many BMCs expose IPMI but leave SOL payload
-    # disabled / unsupported — auto falls through to Redfish serial.
+    # Serial scrape: auto = ipmi SOL then redfish (iDRAC-shaped path). Optional
+    # sol_transport=virsh is a lab escape hatch only — not used by auto.
     sol_transport: auto
+    libvirt_domain: ""
 
     iso_http_bind: "0.0.0.0"
     iso_http_port: 8080
@@ -904,6 +904,8 @@
           - "{{ redfish_system_id | default('') }}"
           - --redfish-manager-id
           - "{{ redfish_vm_resource_id | default('') }}"
+          - --libvirt-domain
+          - "{{ libvirt_domain | default(redfish_system_id, true) | default(redfish_vm_resource_id, true) | default('') }}"
           - --port
           - "{{ ipmi_port | string }}"
           - --timeout

@@ -2,11 +2,12 @@
 """Capture BMC host serial console until hw-gather markers appear.
 
 Transports:
-  auto     – try ipmi, then redfish. Default.
+  auto     – try ipmi, then redfish. Default (matches real BMC / iDRAC labs).
   ipmi     – IPMI SOL via ipmitool (lanplus). Still activates when
              ``sol payload enable`` returns Invalid command (VirtualBMC).
   redfish  – discover SerialConsole via Redfish, then attach over SSH
              (OpenBMC :2200 /console0 only when the BMC looks like OpenBMC)
+  virsh    – optional lab escape hatch (``virsh console``); not used by auto
 """
 
 from __future__ import annotations
@@ -266,6 +267,8 @@ def capture_from_popen(
     keepalive: bytes | None = None,
     keepalive_interval: float = 0.5,
     keepalive_burst: int = 0,
+    disconnect: bytes = b"\r~.\r",
+    startup_pause: float = 0.5,
 ) -> tuple[str, int]:
     """Run cmd and scrape stdout until markers.
 
@@ -274,8 +277,8 @@ def capture_from_popen(
     idle SOL session cannot block past ``timeout`` on ``readline()``.
 
     ``keepalive`` (e.g. ``b"\\r"``) is written on a short interval. VirtualBMC
-    often delivers guest→host serial only after client TX — a multi-second
-    idle interval therefore drips about one line per interval.
+    often delivers guest→host serial only after client TX — prefer ``virsh``
+    on the hypervisor for real-time console.
     """
     import pty
     import select
@@ -299,8 +302,8 @@ def capture_from_popen(
         if stdin_text:
             os.write(master_fd, stdin_text.encode())
 
-        # Wait briefly for "SOL Session operational" before pumping keys.
-        time.sleep(0.5)
+        if startup_pause > 0:
+            time.sleep(startup_pause)
         if keepalive and keepalive_burst > 0:
             try:
                 os.write(master_fd, keepalive * keepalive_burst)
@@ -382,8 +385,8 @@ def capture_from_popen(
     finally:
         if proc and proc.poll() is None:
             try:
-                if master_fd is not None:
-                    os.write(master_fd, b"\r~.\r")
+                if master_fd is not None and disconnect:
+                    os.write(master_fd, disconnect)
             except OSError:
                 pass
             time.sleep(0.3)
@@ -747,6 +750,82 @@ def enable_sol_payload(args: argparse.Namespace) -> str:
     return "ok"
 
 
+def _virsh_base() -> list[str] | None:
+    """Return ``virsh`` argv prefix, preferring passwordless sudo for system URI."""
+    virsh = which("virsh")
+    if not virsh:
+        return None
+    sudo = which("sudo")
+    if sudo:
+        probe = subprocess.run(
+            [sudo, "-n", virsh, "uri"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode == 0:
+            return [sudo, "-n", virsh]
+    return [virsh]
+
+
+def capture_virsh(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
+    """Attach to the guest serial via libvirt (same speed as interactive virsh console)."""
+    domain = (args.libvirt_domain or args.redfish_system_id or "").strip()
+    if not domain:
+        sys.stderr.write(
+            "virsh: skip (set --libvirt-domain or --redfish-system-id)\n"
+        )
+        return "", 4
+    base = _virsh_base()
+    if not base:
+        sys.stderr.write("virsh: not found on PATH\n")
+        return "", 4
+
+    info = subprocess.run(
+        base + ["domstate", domain],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    state = (info.stdout or "").strip().lower()
+    if info.returncode != 0:
+        sys.stderr.write(
+            f"virsh: domain {domain!r} not available: "
+            f"{(info.stderr or info.stdout or '').strip()}\n"
+        )
+        return "", 4
+    if state and state not in ("running", "paused"):
+        sys.stderr.write(
+            f"virsh: domain {domain!r} state={state!r} (need running)\n"
+        )
+        return "", 4
+
+    # Prefer --force so VirtualBMC / a stale console session does not block us.
+    cmd = base + ["console", domain, "--force"]
+    help_out = subprocess.run(
+        base + ["help", "console"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if "--force" not in ((help_out.stdout or "") + (help_out.stderr or "")):
+        cmd = base + ["console", domain]
+
+    sys.stderr.write(
+        f"{' '.join(cmd)} (direct qemu PTY, no SOL pump)\n"
+    )
+    # Ctrl-] is the virsh console escape.
+    return capture_from_popen(
+        cmd,
+        out_path,
+        args.timeout,
+        args.verbose,
+        keepalive=None,
+        disconnect=b"\x1d",
+        startup_pause=0.2,
+    )
+
+
 def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
     require_ipmitool(args.ipmitool)
     payload_status = enable_sol_payload(args)
@@ -928,6 +1007,8 @@ def capture(args: argparse.Namespace) -> int:
     transport = args.transport
     attempts: list[str]
     if transport == "auto":
+        # Real BMCs (iDRAC, etc.): IPMI SOL then Redfish serial. Do not put
+        # virsh in auto — VirtualBMC labs that need it can set --transport virsh.
         attempts = ["ipmi", "redfish"]
     else:
         attempts = [transport]
@@ -936,7 +1017,9 @@ def capture(args: argparse.Namespace) -> int:
     last_code = 4
     for kind in attempts:
         sys.stderr.write(f"=== serial transport: {kind} ===\n")
-        if kind == "redfish":
+        if kind == "virsh":
+            last_buf, last_code = capture_virsh(args, out_path)
+        elif kind == "redfish":
             last_buf, last_code = capture_redfish(args, out_path)
         else:
             last_buf, last_code = capture_ipmi(args, out_path)
@@ -945,15 +1028,14 @@ def capture(args: argparse.Namespace) -> int:
         if last_code == 2 and BEGIN in last_buf:
             # Saw begin marker but not a complete report — don't switch transport.
             return last_code
-        # IPMI already delivered a real console stream but no markers —
-        # Redfish SerialConsole will not help on VirtualBMC/sushy.
-        if kind == "ipmi" and last_code == 2 and any(
+        # Real console stream without markers: later transports won't help.
+        if kind in ("virsh", "ipmi") and last_code == 2 and any(
             s in last_buf
             for s in ("Linux version", "EFI stub", "Booting `", "GRUB")
         ):
             sys.stderr.write(
-                "IPMI SOL saw console output but no hw-gather markers; "
-                "skipping Redfish fallback\n"
+                f"{kind} saw console output but no hw-gather markers; "
+                "skipping remaining transports\n"
             )
             break
         # code 3/4 or empty timeout: try next transport if any
@@ -978,9 +1060,14 @@ def main() -> int:
     parser.add_argument("--cipher-suite", type=int, default=None)
     parser.add_argument(
         "--transport",
-        choices=("redfish", "ipmi", "auto"),
+        choices=("redfish", "ipmi", "virsh", "auto"),
         default="auto",
         help="Serial capture transport (default: auto = ipmi then redfish)",
+    )
+    parser.add_argument(
+        "--libvirt-domain",
+        default="",
+        help="libvirt domain name/UUID for --transport virsh (default: --redfish-system-id)",
     )
     parser.add_argument(
         "--redfish-baseuri",
@@ -998,7 +1085,8 @@ def main() -> int:
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    if not args.password:
+    needs_password = args.transport in ("ipmi", "redfish", "auto")
+    if needs_password and not args.password:
         sys.stderr.write(
             "ERROR: password required (--password or REDFISH_PASSWORD/IPMI_PASSWORD)\n"
         )
