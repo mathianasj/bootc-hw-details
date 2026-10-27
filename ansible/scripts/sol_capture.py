@@ -311,11 +311,15 @@ def capture_from_popen(
         # Partial line carry; select-based reader returns "" when idle.
         carry = ""
         last_rx = time.monotonic()
-        keepalive_armed = keepalive is not None
+        last_keepalive = 0.0
+        # Never permanently disarm: VirtualBMC stalls whenever RX goes quiet
+        # (after Linux version, mid-PCI, between systemd jobs). Only TX when
+        # idle so we don't saturate SOL during dense printk.
 
         def read_line() -> str | None:
-            nonlocal carry, last_rx, keepalive_armed
+            nonlocal carry, last_rx, last_keepalive
             assert proc is not None and master_fd is not None
+            now = time.monotonic()
             if proc.poll() is not None:
                 # Drain remaining PTY data after exit.
                 try:
@@ -337,15 +341,15 @@ def capture_from_popen(
                 return None
             if not ready:
                 if (
-                    keepalive_armed
-                    and keepalive
-                    and (time.monotonic() - last_rx) >= keepalive_interval
+                    keepalive
+                    and (now - last_rx) >= keepalive_interval
+                    and (now - last_keepalive) >= keepalive_interval
                 ):
                     try:
                         os.write(master_fd, keepalive)
                     except OSError:
                         pass
-                    last_rx = time.monotonic()
+                    last_keepalive = now
                 return ""
             try:
                 chunk = os.read(master_fd, 4096)
@@ -357,13 +361,7 @@ def capture_from_popen(
                     return out
                 return None
             last_rx = time.monotonic()
-            text = chunk.decode("utf-8", errors="replace")
-            # Disarm only once the kernel console is live. Matching GRUB's
-            # "Booting `hw-gather…'" or "EFI stub" stops CR too early and
-            # VirtualBMC goes silent before Linux printk starts.
-            if keepalive_armed and "Linux version" in text:
-                keepalive_armed = False
-            carry += text
+            carry += chunk.decode("utf-8", errors="replace")
             if "\n" in carry:
                 line, _, carry = carry.partition("\n")
                 return line + "\n"
@@ -750,10 +748,9 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
     cmd = ipmitool_base(args) + ["sol", "activate"]
     env = os.environ.copy()
     env["IPMITOOL_PASSWORD"] = args.password or ""
-    # VirtualBMC: burst CR to unlock RX, then occasional CR until firmware
-    # appears; stop afterward so we don't saturate SOL mid-kernel.
+    # VirtualBMC: burst CR to unlock RX, then CR only when the stream is idle.
     sys.stderr.write(
-        "IPMI SOL keepalive: CR burst then until first firmware/GRUB/kernel\n"
+        "IPMI SOL keepalive: CR burst, then CR when RX idle >2s\n"
     )
     buf, code = capture_from_popen(
         cmd,
@@ -762,7 +759,7 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
         args.verbose,
         env=env,
         keepalive=b"\r",
-        keepalive_interval=0.5,
+        keepalive_interval=2.0,
         keepalive_burst=8,
     )
     deactivate_sol(args)
@@ -786,7 +783,7 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
             args.verbose,
             env=env,
             keepalive=b"\r",
-            keepalive_interval=0.5,
+            keepalive_interval=2.0,
             keepalive_burst=8,
         )
         deactivate_sol(args)

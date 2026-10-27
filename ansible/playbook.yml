@@ -68,8 +68,8 @@
     # Live ISO build needs rootful podman + host container storage
     podman_cmd: "sudo podman"
 
-    # Live boot + LLDP wait — keep short so a dead SOL fails fast
-    sol_timeout_seconds: 180
+    # Live boot + LLDP wait (45s) + gather; VirtualBMC SOL is slow
+    sol_timeout_seconds: 420
     post_reboot_settle_seconds: 45
     sol_capture_script: "{{ playbook_dir }}/scripts/sol_capture.py"
 
