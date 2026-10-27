@@ -885,6 +885,16 @@
         seconds: 2
       tags: [deploy, capture]
 
+    # VirtualBMC opens the qemu serial with VIR_DOMAIN_CONSOLE_FORCE and will
+    # steal the PTY from virsh mid-dump (BEGIN without END). Park it for the
+    # scrape when we are attached locally.
+    - name: Stop VirtualBMC while capturing via virsh
+      ansible.builtin.command:
+        cmd: sudo systemctl stop vbmcd
+      when: sol_transport | default('auto') == 'virsh'
+      failed_when: false
+      tags: [capture]
+
     - name: Start serial capture after PowerOn
       ansible.builtin.command:
         argv:
@@ -968,6 +978,13 @@
           - "Parsed report: {{ capture_dir }}/hw-gather-report.txt"
       tags: [capture]
 
+    - name: Restart VirtualBMC after virsh capture
+      ansible.builtin.command:
+        cmd: sudo systemctl start vbmcd
+      when: sol_transport | default('auto') == 'virsh'
+      failed_when: false
+      tags: [capture, always]
+
     - name: Fail when SOL capture did not find hw-gather markers
       ansible.builtin.fail:
         msg: >-
@@ -983,6 +1000,13 @@
       tags: [capture]
 
   post_tasks:
+    - name: Ensure VirtualBMC is running after virsh capture
+      ansible.builtin.command:
+        cmd: sudo systemctl start vbmcd
+      when: sol_transport | default('auto') == 'virsh'
+      failed_when: false
+      tags: [always]
+
     - name: Stop ISO HTTP server
       ansible.builtin.shell: |
         set -e

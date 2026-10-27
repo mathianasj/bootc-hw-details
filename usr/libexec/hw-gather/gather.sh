@@ -107,21 +107,44 @@ emit_to_serial() {
   local target
   local wrote=0
   local rc=0
+  local size
+  local offset
+  local chunk=512
+  local n
 
   stop_serial_gettys
   # Let the port settle after getty release / Conflicts= stop.
   sleep 2
 
+  size="$(wc -c <"${path}" | tr -d ' ')"
+
   while IFS= read -r target; do
     [[ -e "${target}" ]] || continue
     [[ -c "${target}" ]] || continue
-    stty -F "${target}" raw -echo 115200 2>/dev/null || true
-    if cat "${path}" >"${target}"; then
+    # Disable IXON/CRTSCTS — a full PTY with flow control hangs ``cat`` forever
+    # (~64KiB), which left SOL captures with BEGIN but no END (rc=2).
+    stty -F "${target}" raw -echo -ixon -ixoff -crtscts 115200 2>/dev/null || true
+    offset=0
+    rc=0
+    while (( offset < size )); do
+      n="${chunk}"
+      if (( offset + n > size )); then
+        n=$((size - offset))
+      fi
+      if ! dd if="${path}" bs=1 skip="${offset}" count="${n}" status=none 2>/dev/null \
+          | timeout 15 dd of="${target}" bs="${n}" count=1 status=none 2>/dev/null; then
+        rc=$?
+        printf 'hw-gather: short write to %s at %s/%s bytes (exit %s)\n' \
+          "${target}" "${offset}" "${size}" "${rc}" >&2
+        break
+      fi
+      offset=$((offset + n))
+      sleep 0.02
+    done
+    if (( offset >= size )); then
       wrote=1
-      printf 'hw-gather: wrote scrape block to %s\n' "${target}" >&2
-    else
-      rc=$?
-      printf 'hw-gather: write to %s failed (exit %s)\n' "${target}" "${rc}" >&2
+      printf 'hw-gather: wrote scrape block to %s (%s bytes)\n' \
+        "${target}" "${size}" >&2
     fi
   done < <(serial_targets)
 
@@ -136,6 +159,7 @@ emit_to_serial() {
 stop_serial_gettys
 for _t in $(serial_targets); do
   [[ -c "${_t}" ]] || continue
+  stty -F "${_t}" raw -echo -ixon -ixoff -crtscts 115200 2>/dev/null || true
   printf '\nhw-gather: collecting inventory (markers follow when done)…\n' >"${_t}" 2>/dev/null || true
 done
 
