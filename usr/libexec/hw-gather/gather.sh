@@ -25,18 +25,31 @@ section() {
   log "================================================================================"
 }
 
+serial_progress() {
+  local msg="$1"
+  local target
+  for target in $(serial_targets); do
+    [[ -c "${target}" ]] || continue
+    printf 'hw-gather: %s\n' "${msg}" >"${target}" 2>/dev/null || true
+  done
+}
+
 run_cmd() {
   local title="$1"
   shift
+  local rc=0
+  local output=""
   section "${title}"
   log "+ $*"
-  if output="$("$@" 2>&1)"; then
+  # lldpcli / smart tooling can block forever on a wedged daemon; never stall emit.
+  if output="$(timeout 30 "$@" 2>&1)"; then
     log "${output}"
   else
     rc=$?
     log "${output}"
     log "(exit ${rc})"
   fi
+  serial_progress "done: ${title}"
 }
 
 bring_up_nics() {
@@ -55,18 +68,24 @@ wait_for_lldp() {
   local neighbors=""
 
   section "Waiting up to ${LLDP_WAIT_SECS}s for LLDP neighbors"
+  serial_progress "waiting up to ${LLDP_WAIT_SECS}s for LLDP neighbors"
   while (( elapsed < LLDP_WAIT_SECS )); do
     if systemctl is-active --quiet lldpd.service 2>/dev/null; then
-      neighbors="$(lldpcli show neighbors 2>/dev/null || true)"
+      neighbors="$(timeout 5 lldpcli show neighbors 2>/dev/null || true)"
       if grep -qE 'Interface:|ChassisID:|SysName:|PortID:' <<<"${neighbors}"; then
         log "LLDP neighbors detected after ${elapsed}s"
+        serial_progress "LLDP neighbors detected after ${elapsed}s"
         return 0
       fi
     fi
     sleep 2
     elapsed=$((elapsed + 2))
+    if (( elapsed % 10 == 0 )); then
+      serial_progress "LLDP wait ${elapsed}/${LLDP_WAIT_SECS}s"
+    fi
   done
   log "Timed out waiting for LLDP neighbors (switches must have LLDP enabled)"
+  serial_progress "LLDP wait timed out; emitting report next"
 }
 
 # Resolve BMC UART devices Redfish SOL / VirtualBMC typically mirror.
@@ -193,6 +212,7 @@ fi
 
 bring_up_nics
 sleep 3
+serial_progress "NICs up; collecting network inventory"
 
 run_cmd "Network interfaces (ip -d addr)" ip -d addr
 run_cmd "Routing" ip route
@@ -207,11 +227,12 @@ for iface in /sys/class/net/*; do
   log ""
   log "--- ${iface} ---"
   {
-    ethtool "${iface}" 2>&1 || true
-    ethtool -i "${iface}" 2>&1 || true
-    ethtool -P "${iface}" 2>&1 || true
+    timeout 10 ethtool "${iface}" 2>&1 || true
+    timeout 10 ethtool -i "${iface}" 2>&1 || true
+    timeout 10 ethtool -P "${iface}" 2>&1 || true
   } >>"${REPORT}"
 done
+serial_progress "ethtool done"
 
 wait_for_lldp
 
@@ -225,6 +246,8 @@ log "Latest:      ${LATEST}"
 
 ln -sfn "${REPORT}" "${LATEST}"
 
+serial_progress "building scrape block"
+
 # Build one scrapeable serial payload (markers + body + markers).
 {
   printf '\n%s\n' "${MARKER_BEGIN}"
@@ -236,6 +259,7 @@ ln -sfn "${REPORT}" "${LATEST}"
   printf '\n%s\n\n' "${MARKER_END}"
 } >"${SERIAL_BLOCK}"
 
+serial_progress "emitting scrape block ($(wc -c <"${SERIAL_BLOCK}" | tr -d ' ') bytes)"
 emit_to_serial "${SERIAL_BLOCK}"
 emit_rc=$?
 

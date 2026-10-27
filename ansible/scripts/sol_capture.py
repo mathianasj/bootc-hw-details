@@ -1046,8 +1046,10 @@ def capture(args: argparse.Namespace) -> int:
 
     if extract_report(last_buf) is not None:
         return finalize(last_buf, out_path, report_path)
-    if last_buf and last_code not in (4,):
-        return finalize(last_buf, out_path, report_path)
+    # Preserve timeout (2) / stream-ended (3) / unavailable (4). Only run
+    # finalize when we already have a complete marked report.
+    if last_buf:
+        out_path.write_text(last_buf, encoding="utf-8", errors="replace")
     return last_code
 
 
