@@ -55,8 +55,9 @@
     ipmi_username: "{{ redfish_username }}"
     ipmi_password: "{{ redfish_password }}"
     ipmi_port: 623
-    # Serial scrape: auto = ipmi SOL then redfish (iDRAC-shaped path). Optional
-    # sol_transport=virsh is a lab escape hatch only — not used by auto.
+    # Serial scrape: auto = ipmi SOL then redfish (iDRAC-shaped path).
+    # VirtualBMC labs: use ipmi (not virsh) so capture exercises IPMI SOL.
+    # sol_transport=virsh remains a hypervisor-only escape hatch.
     sol_transport: auto
     libvirt_domain: ""
 

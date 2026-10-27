@@ -45,8 +45,7 @@ all:
     # Timing (live boot — no Anaconda)
     sol_timeout_seconds: 420
     post_reboot_settle_seconds: 45
-    # Serial scrape: auto (ipmi then redfish; iDRAC-shaped), ipmi, or redfish.
-    # On the hypervisor (VirtualBMC lab), prefer virsh — IPMI SOL often dies
-    # mid-boot before hw-gather markers. Not used by auto.
-    # sol_transport: virsh
-    # libvirt_domain: "bare-vm"  # name or UUID; defaults to redfish_system_id
+    # Serial scrape: auto (ipmi then redfish), ipmi, or redfish.
+    # VirtualBMC lab: sol_transport: ipmi (exercises VirtualBMC SOL).
+    # sol_transport: ipmi
+    # libvirt_domain: "bare-vm"  # only for sol_transport=virsh escape hatch
