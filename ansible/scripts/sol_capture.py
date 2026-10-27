@@ -781,22 +781,26 @@ def capture_virsh(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
         sys.stderr.write("virsh: not found on PATH\n")
         return "", 4
 
-    info = subprocess.run(
-        base + ["domstate", domain],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    state = (info.stdout or "").strip().lower()
-    if info.returncode != 0:
-        sys.stderr.write(
-            f"virsh: domain {domain!r} not available: "
-            f"{(info.stderr or info.stdout or '').strip()}\n"
+    # Playbook PowerOn → capture is a short race; wait for the domain.
+    state = ""
+    last_err = ""
+    for _ in range(30):
+        info = subprocess.run(
+            base + ["domstate", domain],
+            check=False,
+            capture_output=True,
+            text=True,
         )
-        return "", 4
-    if state and state not in ("running", "paused"):
+        state = (info.stdout or "").strip().lower()
+        if info.returncode == 0 and state in ("running", "paused"):
+            break
+        last_err = (info.stderr or info.stdout or "").strip()
+        time.sleep(0.5)
+    else:
         sys.stderr.write(
-            f"virsh: domain {domain!r} state={state!r} (need running)\n"
+            f"virsh: domain {domain!r} not available"
+            f"{f' ({last_err})' if last_err else ''}"
+            f"{f' state={state!r}' if state else ''}\n"
         )
         return "", 4
 
