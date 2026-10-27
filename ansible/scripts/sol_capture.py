@@ -358,17 +358,10 @@ def capture_from_popen(
                 return None
             last_rx = time.monotonic()
             text = chunk.decode("utf-8", errors="replace")
-            # Ignore SOL banner / our own CR echoes when deciding to disarm.
-            if keepalive_armed and any(
-                s in text
-                for s in (
-                    "BdsDxe",
-                    "GRUB",
-                    "Linux version",
-                    "EFI stub",
-                    "hw-gather",
-                )
-            ):
+            # Disarm only once the kernel console is live. Matching GRUB's
+            # "Booting `hw-gather…'" or "EFI stub" stops CR too early and
+            # VirtualBMC goes silent before Linux printk starts.
+            if keepalive_armed and "Linux version" in text:
                 keepalive_armed = False
             carry += text
             if "\n" in carry:
@@ -948,12 +941,11 @@ def capture(args: argparse.Namespace) -> int:
         if last_code == 2 and BEGIN in last_buf:
             # Saw begin marker but not a complete report — don't switch transport.
             return last_code
-        # IPMI already delivered a real console stream (kernel/GRUB) but no
-        # markers — Redfish SerialConsole will not help on VirtualBMC/sushy.
-        if (
-            kind == "ipmi"
-            and last_code == 2
-            and ("Linux version" in last_buf or "GRUB" in last_buf)
+        # IPMI already delivered a real console stream but no markers —
+        # Redfish SerialConsole will not help on VirtualBMC/sushy.
+        if kind == "ipmi" and last_code == 2 and any(
+            s in last_buf
+            for s in ("Linux version", "EFI stub", "Booting `", "GRUB")
         ):
             sys.stderr.write(
                 "IPMI SOL saw console output but no hw-gather markers; "
