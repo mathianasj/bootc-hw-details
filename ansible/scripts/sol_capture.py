@@ -225,6 +225,15 @@ def discover_serial_console(
 # --------------------------------------------------------------------------- readers
 
 
+def _stderr_best_effort(msg: str) -> None:
+    """Write stderr without blocking the SOL reader on a full Ansible pipe."""
+    try:
+        sys.stderr.write(msg)
+        sys.stderr.flush()
+    except (BlockingIOError, OSError):
+        pass
+
+
 def read_until_markers(
     read_line: Callable[[], str | None],
     out_path: Path,
@@ -234,29 +243,62 @@ def read_until_markers(
     """Read lines until markers or timeout. Returns (buffer, exit_code).
 
     exit_code: 0 ok-with-markers-pending-check, 2 timeout, 3 stream ended early
+
+    Avoid echoing every console line to stderr under Ansible async: a full
+    stderr pipe stalls the reader, the PTY backs up, ipmitool cannot ACK SOL
+    packets, and VirtualBMC drops the session mid-boot.
     """
+    import fcntl
+
     deadline = time.monotonic() + timeout
     buf = ""
-    with out_path.open("w", encoding="utf-8", errors="replace") as fh:
-        while time.monotonic() < deadline:
-            line = read_line()
-            if line is None:
-                return buf, 3
-            if line == "":
-                time.sleep(0.05)
-                continue
-            fh.write(line)
-            fh.flush()
-            buf += line
-            if verbose:
-                sys.stderr.write(line)
-                sys.stderr.flush()
-            if END in buf and BEGIN in buf and extract_report(buf) is not None:
-                return buf, 0
-    sys.stderr.write(
-        f"ERROR: timed out after {timeout}s waiting for {BEGIN} / {END}\n"
-    )
-    return buf, 2
+    lines = 0
+    last_progress = time.monotonic()
+    stderr_flags = None
+    try:
+        fd = sys.stderr.fileno()
+        stderr_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, stderr_flags | os.O_NONBLOCK)
+    except Exception:
+        stderr_flags = None
+
+    try:
+        with out_path.open("w", encoding="utf-8", errors="replace") as fh:
+            while time.monotonic() < deadline:
+                line = read_line()
+                if line is None:
+                    return buf, 3
+                if line == "":
+                    time.sleep(0.05)
+                    continue
+                fh.write(line)
+                lines += 1
+                if lines % 20 == 0 or BEGIN in line or END in line:
+                    fh.flush()
+                buf += line
+                if verbose:
+                    _stderr_best_effort(line)
+                now = time.monotonic()
+                if now - last_progress >= 15.0:
+                    _stderr_best_effort(
+                        f"SOL capture: {lines} lines, {len(buf)} bytes "
+                        f"({int(deadline - now)}s left)…\n"
+                    )
+                    last_progress = now
+                    fh.flush()
+                if END in buf and BEGIN in buf and extract_report(buf) is not None:
+                    fh.flush()
+                    return buf, 0
+        _stderr_best_effort(
+            f"ERROR: timed out after {timeout}s waiting for {BEGIN} / {END}\n"
+        )
+        return buf, 2
+    finally:
+        if stderr_flags is not None:
+            try:
+                fcntl.fcntl(sys.stderr.fileno(), fcntl.F_SETFL, stderr_flags)
+            except Exception:
+                pass
 
 
 def capture_from_popen(
@@ -372,8 +414,20 @@ def capture_from_popen(
                     out, carry = carry, ""
                     return out
                 return None
-            # Do NOT keepalive here — TX while RX is dense drops the session.
+            # Drain the PTY while data is ready so ipmitool is never blocked
+            # on a full slave buffer (that stalls SOL ACKs → VirtualBMC drops).
             carry += chunk.decode("utf-8", errors="replace")
+            while True:
+                try:
+                    more, _, _ = select.select([master_fd], [], [], 0)
+                    if not more:
+                        break
+                    chunk = os.read(master_fd, 65536)
+                    if not chunk:
+                        break
+                    carry += chunk.decode("utf-8", errors="replace")
+                except OSError:
+                    break
             if "\n" in carry:
                 line, _, carry = carry.partition("\n")
                 return line + "\n"

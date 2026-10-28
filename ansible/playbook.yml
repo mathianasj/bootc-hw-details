@@ -916,8 +916,7 @@
               '--port', ipmi_port | string,
               '--timeout', sol_timeout_seconds | string,
               '--output', capture_dir ~ '/sol-raw.log',
-              '--report', capture_dir ~ '/hw-gather-report.txt',
-              '--verbose'
+              '--report', capture_dir ~ '/hw-gather-report.txt'
             ]
             + (
               ['--cipher-suite', ipmi_cipher_suite | string]
