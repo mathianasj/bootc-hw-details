@@ -40,7 +40,9 @@ BLOCK_RE = re.compile(
 
 
 def extract_report(text: str) -> str | None:
-    match = BLOCK_RE.search(text)
+    # VirtualBMC CR keepalive embeds \r; normalize so markers still match.
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    match = BLOCK_RE.search(normalized)
     return match.group(1) if match else None
 
 
@@ -312,16 +314,20 @@ def capture_from_popen(
 
         # Partial line carry; select-based reader returns "" when idle.
         carry = ""
-        last_rx = time.monotonic()
         last_keepalive = 0.0
-        # Never permanently disarm: VirtualBMC stalls whenever RX goes quiet
-        # (after Linux version, mid-PCI, between systemd jobs). Only TX when
-        # idle so we don't saturate SOL during dense printk.
+        # VirtualBMC gates guest→host on client TX, but CR *during* dense RX
+        # kills the SOL session (stalls at early kernel). Pump only when idle,
+        # forever — never permanently disarm between printk bursts.
+        # Select timeout tracks keepalive so idle polls are not stuck at 0.5s.
+        idle_wait = (
+            min(0.5, max(0.05, keepalive_interval))
+            if keepalive
+            else 0.5
+        )
 
         def read_line() -> str | None:
-            nonlocal carry, last_rx, last_keepalive
+            nonlocal carry, last_keepalive
             assert proc is not None and master_fd is not None
-            now = time.monotonic()
             if proc.poll() is not None:
                 # Drain remaining PTY data after exit.
                 try:
@@ -338,18 +344,21 @@ def capture_from_popen(
                     return out
                 return None
             try:
-                ready, _, _ = select.select([master_fd], [], [], 0.5)
+                ready, _, _ = select.select([master_fd], [], [], idle_wait)
             except (OSError, ValueError):
                 return None
             if not ready:
-                # VirtualBMC gates guest→host on client TX: a long idle interval
-                # drips one line per pump. Poll quickly while quiet.
+                # Quiet console: nudge VirtualBMC so buffered guest serial
+                # drips again (same idea as holding Enter in a manual session).
+                now = time.monotonic()
                 if (
                     keepalive
                     and (now - last_keepalive) >= keepalive_interval
                 ):
                     try:
-                        os.write(master_fd, keepalive)
+                        # Small burst drains faster than 1 CR/tick without
+                        # the mid-stream spam that kills the session.
+                        os.write(master_fd, keepalive * 3)
                     except OSError:
                         pass
                     last_keepalive = now
@@ -363,14 +372,7 @@ def capture_from_popen(
                     out, carry = carry, ""
                     return out
                 return None
-            last_rx = time.monotonic()
-            # Nudge for more buffered serial (rate-limited).
-            if keepalive and (last_rx - last_keepalive) >= keepalive_interval:
-                try:
-                    os.write(master_fd, keepalive)
-                except OSError:
-                    pass
-                last_keepalive = last_rx
+            # Do NOT keepalive here — TX while RX is dense drops the session.
             carry += chunk.decode("utf-8", errors="replace")
             if "\n" in carry:
                 line, _, carry = carry.partition("\n")
@@ -838,9 +840,10 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
     cmd = ipmitool_base(args) + ["sol", "activate"]
     env = os.environ.copy()
     env["IPMITOOL_PASSWORD"] = args.password or ""
-    # VirtualBMC gates RX on TX — poll CR ~5/s (like holding Enter), not every 2s.
+    # VirtualBMC gates RX on TX. Idle-only CR (never while RX is dense) —
+    # mid-stream CR kills the session and stalls sol-raw at early kernel.
     sys.stderr.write(
-        "IPMI SOL keepalive: CR burst, then CR ~every 0.2s to drain VirtualBMC\n"
+        "IPMI SOL keepalive: CR burst at start, then idle-only CR ~every 0.15s\n"
     )
     buf, code = capture_from_popen(
         cmd,
@@ -849,7 +852,7 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
         args.verbose,
         env=env,
         keepalive=b"\r",
-        keepalive_interval=0.2,
+        keepalive_interval=0.15,
         keepalive_burst=8,
     )
     deactivate_sol(args)
@@ -873,7 +876,7 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
             args.verbose,
             env=env,
             keepalive=b"\r",
-            keepalive_interval=0.2,
+            keepalive_interval=0.15,
             keepalive_burst=8,
         )
         deactivate_sol(args)

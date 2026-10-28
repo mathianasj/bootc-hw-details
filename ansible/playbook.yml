@@ -55,6 +55,9 @@
     ipmi_username: "{{ redfish_username }}"
     ipmi_password: "{{ redfish_password }}"
     ipmi_port: 623
+    # VirtualBMC often needs cipher 3 (matches: ipmitool -C 3 sol activate).
+    # Real iDRAC usually works with the ipmitool default; override if needed.
+    ipmi_cipher_suite: 3
     # Serial scrape: auto = ipmi SOL then redfish (iDRAC-shaped path).
     # VirtualBMC labs: use ipmi (not virsh) so capture exercises IPMI SOL.
     # sol_transport=virsh remains a hypervisor-only escape hatch.
@@ -898,34 +901,30 @@
 
     - name: Start serial capture after PowerOn
       ansible.builtin.command:
-        argv:
-          - python3
-          - "{{ sol_capture_script }}"
-          - --transport
-          - "{{ sol_transport | default('auto') }}"
-          - --host
-          - "{{ redfish_bmc_host }}"
-          - --username
-          - "{{ ipmi_username }}"
-          - --password
-          - "{{ ipmi_password }}"
-          - --redfish-baseuri
-          - "{{ redfish_baseuri }}"
-          - --redfish-system-id
-          - "{{ redfish_system_id | default('') }}"
-          - --redfish-manager-id
-          - "{{ redfish_vm_resource_id | default('') }}"
-          - --libvirt-domain
-          - "{{ libvirt_domain | default(redfish_system_id, true) | default(redfish_vm_resource_id, true) | default('') }}"
-          - --port
-          - "{{ ipmi_port | string }}"
-          - --timeout
-          - "{{ sol_timeout_seconds | string }}"
-          - --output
-          - "{{ capture_dir }}/sol-raw.log"
-          - --report
-          - "{{ capture_dir }}/hw-gather-report.txt"
-          - --verbose
+        argv: >-
+          {{
+            [
+              'python3', sol_capture_script,
+              '--transport', sol_transport | default('auto'),
+              '--host', redfish_bmc_host,
+              '--username', ipmi_username,
+              '--password', ipmi_password,
+              '--redfish-baseuri', redfish_baseuri,
+              '--redfish-system-id', redfish_system_id | default(''),
+              '--redfish-manager-id', redfish_vm_resource_id | default(''),
+              '--libvirt-domain', libvirt_domain | default(redfish_system_id, true) | default(redfish_vm_resource_id, true) | default(''),
+              '--port', ipmi_port | string,
+              '--timeout', sol_timeout_seconds | string,
+              '--output', capture_dir ~ '/sol-raw.log',
+              '--report', capture_dir ~ '/hw-gather-report.txt',
+              '--verbose'
+            ]
+            + (
+              ['--cipher-suite', ipmi_cipher_suite | string]
+              if (ipmi_cipher_suite | default(none) is not none)
+              else []
+            )
+          }}
       async: "{{ (sol_timeout_seconds | int) + 120 }}"
       poll: 0
       register: sol_async
