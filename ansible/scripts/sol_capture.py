@@ -278,9 +278,9 @@ def capture_from_popen(
     and some BMCs dropping data on a plain pipe). Reads with ``select`` so an
     idle SOL session cannot block past ``timeout`` on ``readline()``.
 
-    ``keepalive`` (e.g. ``b"\\r"``) is written on a short interval. VirtualBMC
-    often delivers guest→host serial only after client TX — prefer ``virsh``
-    on the hypervisor for real-time console.
+    ``keepalive`` (optional ``b"\\r"``) is for transports that need client TX
+    to drip output. Do **not** use it for IPMI SOL against VirtualBMC: input
+    queue overflow closes the session; ipmitool's own keepalives are enough.
     """
     import pty
     import select
@@ -840,10 +840,12 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
     cmd = ipmitool_base(args) + ["sol", "activate"]
     env = os.environ.copy()
     env["IPMITOOL_PASSWORD"] = args.password or ""
-    # VirtualBMC gates RX on TX. Idle-only CR (never while RX is dense) —
-    # mid-stream CR kills the session and stalls sol-raw at early kernel.
+    # Match a manual `ipmitool sol activate`: no stdin CR spam. VirtualBMC
+    # keeps the session via ipmitool's Get Device ID keepalives; a 4 KiB
+    # input queue overflow from injected CRs closes SOL mid-boot.
     sys.stderr.write(
-        "IPMI SOL keepalive: CR burst at start, then idle-only CR ~every 0.15s\n"
+        "IPMI SOL: PTY capture, no stdin keepalive "
+        "(ipmitool Get Device ID keeps the session)\n"
     )
     buf, code = capture_from_popen(
         cmd,
@@ -851,9 +853,7 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
         args.timeout,
         args.verbose,
         env=env,
-        keepalive=b"\r",
-        keepalive_interval=0.15,
-        keepalive_burst=8,
+        keepalive=None,
     )
     deactivate_sol(args)
 
@@ -875,9 +875,7 @@ def capture_ipmi(args: argparse.Namespace, out_path: Path) -> tuple[str, int]:
             args.timeout,
             args.verbose,
             env=env,
-            keepalive=b"\r",
-            keepalive_interval=0.15,
-            keepalive_burst=8,
+            keepalive=None,
         )
         deactivate_sol(args)
 
