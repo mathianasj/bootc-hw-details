@@ -24,6 +24,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -317,12 +318,12 @@ def capture_from_popen(
     """Run cmd and scrape stdout until markers.
 
     Uses a PTY so ipmitool SOL can tcsetattr (avoids ``Inappropriate ioctl``
-    and some BMCs dropping data on a plain pipe). Reads with ``select`` so an
-    idle SOL session cannot block past ``timeout`` on ``readline()``.
+    on a plain pipe). A dedicated thread continuously drains the PTY into the
+    log — same as an interactive terminal. The old line-at-a-time select loop
+    could leave the PTY full so ipmitool blocked and VirtualBMC dropped SOL
+    ACKs mid-boot (standalone ``ipmitool sol activate`` kept working).
 
-    ``keepalive`` (optional ``b"\\r"``) is for transports that need client TX
-    to drip output. Do **not** use it for IPMI SOL against VirtualBMC: input
-    queue overflow closes the session; ipmitool's own keepalives are enough.
+    ``keepalive`` (optional ``b"\\r"``) is for non-IPMI transports only.
     """
     import pty
     import select
@@ -330,8 +331,81 @@ def capture_from_popen(
     master_fd: int | None = None
     slave_fd: int | None = None
     proc: subprocess.Popen[bytes] | None = None
+    reader: threading.Thread | None = None
+    stop = threading.Event()
+    buf_lock = threading.Lock()
+    buf_parts: list[str] = []
+    drain_exc: list[BaseException] = []
+
+    def drain() -> None:
+        assert master_fd is not None
+        last_ka = 0.0
+        idle_wait = (
+            min(0.5, max(0.05, keepalive_interval)) if keepalive else 0.5
+        )
+        try:
+            with out_path.open("w", encoding="utf-8", errors="replace") as fh:
+                while not stop.is_set():
+                    try:
+                        ready, _, _ = select.select([master_fd], [], [], idle_wait)
+                    except (OSError, ValueError):
+                        break
+                    if not ready:
+                        now = time.monotonic()
+                        if (
+                            keepalive
+                            and (now - last_ka) >= keepalive_interval
+                        ):
+                            try:
+                                os.write(master_fd, keepalive * 3)
+                            except OSError:
+                                break
+                            last_ka = now
+                        continue
+                    try:
+                        chunk = os.read(master_fd, 65536)
+                    except OSError:
+                        break
+                    if not chunk:
+                        # Keep draining briefly after child exit.
+                        if proc is not None and proc.poll() is not None:
+                            break
+                        continue
+                    text = chunk.decode("utf-8", errors="replace")
+                    # Vacuum any remaining ready bytes before writing.
+                    while True:
+                        try:
+                            more, _, _ = select.select([master_fd], [], [], 0)
+                            if not more:
+                                break
+                            extra = os.read(master_fd, 65536)
+                            if not extra:
+                                break
+                            text += extra.decode("utf-8", errors="replace")
+                        except OSError:
+                            break
+                    fh.write(text)
+                    fh.flush()
+                    with buf_lock:
+                        buf_parts.append(text)
+                    if verbose:
+                        _stderr_best_effort(text)
+        except BaseException as exc:  # noqa: BLE001 — surface to waiter
+            drain_exc.append(exc)
+
     try:
         master_fd, slave_fd = pty.openpty()
+        # Match a real terminal: disable kernel echo on the slave so our
+        # optional keepalive CRs are not reflected into the capture.
+        try:
+            import termios
+
+            attrs = termios.tcgetattr(slave_fd)
+            attrs[3] = attrs[3] & ~termios.ECHO
+            termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
+        except Exception:
+            pass
+
         proc = subprocess.Popen(
             cmd,
             stdin=slave_fd,
@@ -354,91 +428,43 @@ def capture_from_popen(
             except OSError:
                 pass
 
-        # Partial line carry; select-based reader returns "" when idle.
-        carry = ""
-        last_keepalive = 0.0
-        # VirtualBMC gates guest→host on client TX, but CR *during* dense RX
-        # kills the SOL session (stalls at early kernel). Pump only when idle,
-        # forever — never permanently disarm between printk bursts.
-        # Select timeout tracks keepalive so idle polls are not stuck at 0.5s.
-        idle_wait = (
-            min(0.5, max(0.05, keepalive_interval))
-            if keepalive
-            else 0.5
-        )
+        reader = threading.Thread(target=drain, name="sol-pty-drain", daemon=True)
+        reader.start()
 
-        def read_line() -> str | None:
-            nonlocal carry, last_keepalive
-            assert proc is not None and master_fd is not None
-            if proc.poll() is not None:
-                # Drain remaining PTY data after exit.
-                try:
-                    ready, _, _ = select.select([master_fd], [], [], 0.2)
-                    if ready:
-                        chunk = os.read(master_fd, 4096).decode(
-                            "utf-8", errors="replace"
-                        )
-                        carry += chunk
-                except OSError:
-                    pass
-                if carry:
-                    out, carry = carry, ""
-                    return out
-                return None
-            try:
-                ready, _, _ = select.select([master_fd], [], [], idle_wait)
-            except (OSError, ValueError):
-                return None
-            if not ready:
-                # Quiet console: nudge VirtualBMC so buffered guest serial
-                # drips again (same idea as holding Enter in a manual session).
-                now = time.monotonic()
-                if (
-                    keepalive
-                    and (now - last_keepalive) >= keepalive_interval
-                ):
-                    try:
-                        # Small burst drains faster than 1 CR/tick without
-                        # the mid-stream spam that kills the session.
-                        os.write(master_fd, keepalive * 3)
-                    except OSError:
-                        pass
-                    last_keepalive = now
-                return ""
-            try:
-                chunk = os.read(master_fd, 4096)
-            except OSError:
-                return None
-            if not chunk:
-                if carry:
-                    out, carry = carry, ""
-                    return out
-                return None
-            # Drain the PTY while data is ready so ipmitool is never blocked
-            # on a full slave buffer (that stalls SOL ACKs → VirtualBMC drops).
-            carry += chunk.decode("utf-8", errors="replace")
-            while True:
-                try:
-                    more, _, _ = select.select([master_fd], [], [], 0)
-                    if not more:
-                        break
-                    chunk = os.read(master_fd, 65536)
-                    if not chunk:
-                        break
-                    carry += chunk.decode("utf-8", errors="replace")
-                except OSError:
-                    break
-            if "\n" in carry:
-                line, _, carry = carry.partition("\n")
-                return line + "\n"
-            # Flush long chunks without newline so progress still hits the log.
-            if len(carry) >= 512:
-                out, carry = carry, ""
-                return out
-            return ""
+        deadline = time.monotonic() + timeout
+        last_progress = time.monotonic()
+        code = 2
+        while time.monotonic() < deadline:
+            with buf_lock:
+                buf = "".join(buf_parts)
+            if END in buf and BEGIN in buf and extract_report(buf) is not None:
+                code = 0
+                break
+            if proc.poll() is not None and not reader.is_alive():
+                # Child exited and drain finished — no markers.
+                code = 3
+                break
+            now = time.monotonic()
+            if now - last_progress >= 15.0:
+                _stderr_best_effort(
+                    f"SOL capture: {len(buf)} bytes "
+                    f"({int(deadline - now)}s left)…\n"
+                )
+                last_progress = now
+            time.sleep(0.1)
+        else:
+            _stderr_best_effort(
+                f"ERROR: timed out after {timeout}s waiting for {BEGIN} / {END}\n"
+            )
+            code = 2
 
-        return read_until_markers(read_line, out_path, timeout, verbose)
+        if drain_exc:
+            _stderr_best_effort(f"SOL drain error: {drain_exc[0]!r}\n")
+        with buf_lock:
+            buf = "".join(buf_parts)
+        return buf, code
     finally:
+        stop.set()
         if proc and proc.poll() is None:
             try:
                 if master_fd is not None and disconnect:
@@ -451,6 +477,8 @@ def capture_from_popen(
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        if reader is not None:
+            reader.join(timeout=2.0)
         if slave_fd is not None:
             try:
                 os.close(slave_fd)
